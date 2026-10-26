@@ -1,7 +1,7 @@
 # Radar-Centric 3D Detection with LiDAR-Guided Geometry Supervision
 
 A radar + monocular camera 3D object detector built on CenterPoint and evaluated on [View-of-Delft](https://intelligent-vehicles.org/datasets/view-of-delft/). LiDAR is used **only during training**, as a privileged geometry signal; inference runs on radar and camera alone.
-Course project for TU Delft RO47020 *Advanced Machine Perception* (Mar–Apr 2026). Authors: Ruifang Zhang, Lude Krikke, Emile de Kam.
+Course project for TU Delft RO47020 *Advanced Machine Perception* (Mar–Apr 2026).
 
 **Result (validation split):** driving-corridor (ROI) mAP **53.59 → 65.75**; entire-area mAP **31.96 → 42.80** (43.55 for the best entire-area variant).
 
