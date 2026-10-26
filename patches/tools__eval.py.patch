@@ -1,0 +1,37 @@
+diff --git a/src/tools/eval.py b/src/tools/eval.py
+index ca754e2..43f6d04 100644
+--- a/src/tools/eval.py
++++ b/src/tools/eval.py
+@@ -22,8 +22,24 @@ from src.dataset import ViewOfDelft, collate_vod_batch
+ def eval(cfg: DictConfig) -> None:
+     print('Evaluating model...')
+     L.seed_everything(cfg.seed, workers=True)
++
++    dataset_cfg = cfg.get('dataset', {})
++    point_source = dataset_cfg.get('point_source', 'radar')
++    radar_folder = dataset_cfg.get('radar_folder', 'radar')
++    load_image = dataset_cfg.get(
++        'load_image',
++        cfg.model.get('fusion_mode', 'radar_only') != 'radar_only',
++    )
++    transform_radar_to_lidar = dataset_cfg.get('transform_radar_to_lidar', True)
+     
+-    val_dataset = ViewOfDelft(data_root=cfg.data_root, split='val')
++    val_dataset = ViewOfDelft(
++        data_root=cfg.data_root,
++        split='val',
++        point_source=point_source,
++        radar_folder=radar_folder,
++        load_image=load_image,
++        transform_radar_to_lidar=transform_radar_to_lidar,
++    )
+     val_dataloader = DataLoader(val_dataset, 
+                                 batch_size=1, 
+                                 num_workers=cfg.num_workers, 
+@@ -48,4 +64,4 @@ def eval(cfg: DictConfig) -> None:
+                      
+     
+ if __name__ == '__main__':
+-    eval()
+\ No newline at end of file
++    eval()

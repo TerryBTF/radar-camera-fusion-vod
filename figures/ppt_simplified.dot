@@ -1,0 +1,77 @@
+digraph AMP_Group12_PPT {
+    graph [
+        rankdir=LR,
+        bgcolor="white",
+        pad="0.25",
+        nodesep="0.45",
+        ranksep="0.7",
+        splines=ortho,
+        fontname="Microsoft YaHei"
+    ];
+
+    node [
+        shape=box,
+        style="rounded,filled",
+        color="#243447",
+        penwidth=1.4,
+        fontname="Microsoft YaHei",
+        fontsize=16,
+        margin="0.18,0.12"
+    ];
+
+    edge [
+        color="#4F6D7A",
+        penwidth=1.5,
+        arrowsize=0.8
+    ];
+
+    subgraph cluster_input {
+        label="Input";
+        fontsize=18;
+        fontname="Microsoft YaHei";
+        color="#BFD7EA";
+        style="rounded";
+
+        cfg [label="Hydra Config\ntrain / eval / test", fillcolor="#EAF4FB"];
+        data [label="ViewOfDelft Dataset\nRadar points + labels", fillcolor="#EAF4FB"];
+        loader [label="DataLoader\ncollate_vod_batch", fillcolor="#EAF4FB"];
+    }
+
+    subgraph cluster_model {
+        label="Radar CenterPoint Model";
+        fontsize=18;
+        fontname="Microsoft YaHei";
+        color="#CFE8CF";
+        style="rounded";
+
+        voxel [label="Voxelization", fillcolor="#EEF8EE"];
+        pfn [label="PillarFeatureNet", fillcolor="#EEF8EE"];
+        scatter [label="BEV Scatter", fillcolor="#EEF8EE"];
+        backbone [label="SECOND Backbone\n+ FPN Neck", fillcolor="#EEF8EE"];
+        head [label="CenterHead\nCar / Pedestrian / Cyclist", fillcolor="#EEF8EE"];
+    }
+
+    subgraph cluster_output {
+        label="Output";
+        fontsize=18;
+        fontname="Microsoft YaHei";
+        color="#F4D6AE";
+        style="rounded";
+
+        train_out [label="Training\nHeatmap loss + box loss", fillcolor="#FFF5E8"];
+        infer_out [label="Inference\nDecode + NMS", fillcolor="#FFF5E8"];
+        result [label="mAP metrics\nor prediction files", fillcolor="#FFF5E8"];
+    }
+
+    cfg -> data;
+    data -> loader;
+    loader -> voxel;
+    voxel -> pfn;
+    pfn -> scatter;
+    scatter -> backbone;
+    backbone -> head;
+    head -> train_out;
+    head -> infer_out;
+    train_out -> result;
+    infer_out -> result;
+}

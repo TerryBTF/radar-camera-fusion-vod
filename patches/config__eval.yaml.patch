@@ -1,0 +1,11 @@
+diff --git a/src/config/eval.yaml b/src/config/eval.yaml
+index 82ee903..b69197c 100644
+--- a/src/config/eval.yaml
++++ b/src/config/eval.yaml
+@@ -1,5 +1,5 @@
+ defaults: 
+-  - model: centerpoint
++  - model: centerpoint_radar
+   - _self_
+ exp_id: centerpoint_default
+ 

@@ -1,0 +1,33 @@
+defaults:
+  - model: centerpoint_radar_image_layer3
+  - _self_
+
+seed: 47020
+exp_id: centerpoint_radar_gated_fusion_finetune_layer3_stable_radar_to_lidar_main_struct_radar_changes
+
+data_root: data/view_of_delft
+output_dir: outputs/${exp_id}
+checkpoint_path: null
+
+class_names: ['Car', 'Pedestrian', 'Cyclist']
+
+batch_size: 4
+num_workers: 2
+epochs: 12
+
+val_every: 3
+save_top_model: 5
+log_every: 50
+
+gpus: [0]
+sync_bn: true
+
+dataset:
+  radar_folder: radar_3frames
+  transform_radar_to_lidar: true
+
+model:
+  fusion_mode: image_sampling_finetune_layer3
+  image_branch:
+    backbone_lr_mult: 0.1
+    freeze_bn: true

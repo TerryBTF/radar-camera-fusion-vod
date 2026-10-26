@@ -1,0 +1,42 @@
+diff --git a/src/config/model/centerpoint_radar.yaml b/src/config/model/centerpoint_radar.yaml
+index 253186f..d3fd688 100644
+--- a/src/config/model/centerpoint_radar.yaml
++++ b/src/config/model/centerpoint_radar.yaml
+@@ -15,8 +15,9 @@ pts_voxel_layer:
+ 
+ voxel_encoder:
+   in_channels: 7
+-  feat_channels: [64]
+-  with_distance: FALSE
++  feat_channels: [64, 64]
++  pool_mode: 'avg'
++  with_distance: TRUE
+   voxel_size: ${model.voxel_size}
+   point_cloud_range: ${model.point_cloud_range}
+ 
+@@ -49,6 +50,7 @@ head:
+     rot: [2, 2] # no need vel
+     heatmap: ~
+   share_conv_channel: 64
++  share_conv_num_layers: 2
+   bbox_coder:
+     pc_range: ${model.point_cloud_range}
+     post_center_range: [-5, -30.6, -6, 56.2, 30.6, 5]
+@@ -77,13 +79,14 @@ head:
+     dense_reg: 1
+     gaussian_overlap: 0.1
+     max_objs: 500
+-    min_radius: 2
+-    code_weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
++    use_classwise_min_radius: true
++    min_radius: [4, 2, 2]
++    code_weights: [1.0, 1.0, 0.2, 1.0, 1.0, 0.2, 1.0, 1.0]
+   test_cfg:
+     post_center_limit_range: [-5, -30.6, -6, 56.2, 30.6, 5]
+     max_per_img: 500
+     max_pool_nms: False
+-    min_radius: [4, 0.3, 0.85]
++    min_radius: [4, 0.6, 1.2]
+     score_threshold: 0.1
+     out_size_factor: 2
+     nms_type: 'circle'

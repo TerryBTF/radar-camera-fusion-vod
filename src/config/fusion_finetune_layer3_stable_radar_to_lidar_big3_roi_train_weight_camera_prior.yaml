@@ -1,0 +1,11 @@
+defaults:
+  - fusion_finetune_layer3_stable_radar_to_lidar_big3_roi_train_weight
+  - _self_
+
+exp_id: centerpoint_radar_gated_fusion_finetune_layer3_stable_radar_to_lidar_big3_roi_train_weight_camera_prior
+
+model:
+  camera_prior:
+    enabled: true
+    hidden_channels: 64
+    prior_scale: 0.5

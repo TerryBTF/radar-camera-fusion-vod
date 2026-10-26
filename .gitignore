@@ -1,0 +1,9 @@
+data/
+outputs/
+lightning_logs/__pycache__/
+*.pyc
+*.ckpt
+*.pth
+wandb/
+*.egg-info/
+build/

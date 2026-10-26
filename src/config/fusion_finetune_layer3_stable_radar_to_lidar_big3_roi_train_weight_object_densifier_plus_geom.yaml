@@ -1,0 +1,14 @@
+defaults:
+  - fusion_finetune_layer3_stable_radar_to_lidar_big3_roi_train_weight_object_densifier
+  - _self_
+
+exp_id: centerpoint_radar_gated_fusion_finetune_layer3_stable_radar_to_lidar_big3_roi_train_weight_object_densifier_plus_geom
+
+model:
+  geometry_aux:
+    enabled: true
+    hidden_channels: 128
+    loss_weight: 0.2
+    occupancy_weight: 1.0
+    density_weight: 0.5
+    max_density: 16.0

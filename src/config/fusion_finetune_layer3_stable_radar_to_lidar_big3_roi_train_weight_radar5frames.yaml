@@ -1,0 +1,9 @@
+defaults:
+  - fusion_finetune_layer3_stable_radar_to_lidar_big3_roi_train_weight
+  - _self_
+
+exp_id: centerpoint_radar_gated_fusion_finetune_layer3_stable_radar_to_lidar_big3_roi_train_weight_radar5frames
+
+dataset:
+  radar_folder: radar_5frames
+  transform_radar_to_lidar: true

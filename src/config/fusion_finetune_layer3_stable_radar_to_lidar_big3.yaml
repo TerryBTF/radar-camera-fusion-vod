@@ -1,0 +1,22 @@
+defaults:
+  - fusion_finetune_layer3_stable_radar_to_lidar_ped_highres
+  - _self_
+
+exp_id: centerpoint_radar_gated_fusion_finetune_layer3_stable_radar_to_lidar_big3
+
+model:
+  temporal_encoder:
+    enabled: true
+    hidden_dim: 32
+    feature_indices: [3, 4, 5, 6]
+    residual_scale: 0.5
+  bev_fusion:
+    enabled: true
+    hidden_channels: 128
+  geometry_aux:
+    enabled: true
+    hidden_channels: 128
+    loss_weight: 0.2
+    occupancy_weight: 1.0
+    density_weight: 0.5
+    max_density: 16.0

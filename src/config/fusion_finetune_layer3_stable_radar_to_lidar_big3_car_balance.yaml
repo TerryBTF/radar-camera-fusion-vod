@@ -1,0 +1,9 @@
+defaults:
+  - fusion_finetune_layer3_stable_radar_to_lidar_big3
+  - _self_
+
+exp_id: centerpoint_radar_gated_fusion_finetune_layer3_stable_radar_to_lidar_big3_car_balance
+
+model:
+  geometry_aux:
+    loss_weight: 0.1

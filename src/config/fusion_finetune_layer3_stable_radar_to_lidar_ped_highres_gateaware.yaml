@@ -1,0 +1,11 @@
+defaults:
+  - fusion_finetune_layer3_stable_radar_to_lidar
+  - _self_
+
+exp_id: centerpoint_radar_gated_fusion_finetune_layer3_stable_radar_to_lidar_main_struct_radar_changes_ped_highres_gateaware
+
+model:
+  image_branch:
+    feature_layer: layer2_layer3
+    structured_fusion: true
+    use_context_gate: true

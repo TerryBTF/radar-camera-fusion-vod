@@ -1,0 +1,14 @@
+diff --git a/src/config/train.yaml b/src/config/train.yaml
+index 263eb05..4c43e6f 100644
+--- a/src/config/train.yaml
++++ b/src/config/train.yaml
+@@ -23,6 +23,9 @@ epochs: 50
+ log_every: 50
+ val_every: 3
+ save_top_model: 5
++use_wandb: true
++wandb_mode: offline
++wandb_watch_model: false
+ 
+ 
+ 

@@ -1,0 +1,1527 @@
+diff --git a/src/model/detector/centerpoint.py b/src/model/detector/centerpoint.py
+index 5c3e20c..cbe2d57 100644
+--- a/src/model/detector/centerpoint.py
++++ b/src/model/detector/centerpoint.py
+@@ -2,11 +2,14 @@ import os
+ import tempfile
+ import pickle
+ from datetime import datetime
++from pathlib import Path
+ 
+ import numpy as np 
+ import torch
++import torch.nn as nn
+ import torch.nn.functional as F
+ from collections import OrderedDict
++from omegaconf import OmegaConf
+ 
+ from vod.evaluation import Evaluation
+ from vod.configuration import KittiLocations
+@@ -16,12 +19,21 @@ from vod.frame import FrameDataLoader, FrameTransformMatrix, homogeneous_transfo
+ import lightning as L
+ import torch.distributed as dist
+ 
+-from src.ops import Voxelization
++from src.ops import Voxelization, voxelization, DynamicScatter, points_in_boxes_gpu
+ from src.model.voxel_encoders import PillarFeatureNet
+ from src.model.middle_encoders import PointPillarsScatter
+ from src.model.backbones import SECOND
+ from src.model.necks import SECONDFPN
+ from src.model.heads import CenterHead
++from src.model.image_backbones import ResNet18Layer3
++from src.model.fusion import (
++    PointGatedFusion,
++    BEVGatedFusion,
++    TemporalRadarEncoder,
++    GeometryAuxHead,
++    RadarBEVSelfAttention,
++    RadarObjectDensifier,
++)
+ 
+ class CenterPoint(L.LightningModule):
+     def __init__(self, config):
+@@ -33,6 +45,25 @@ class CenterPoint(L.LightningModule):
+         self.class_names = config.get('class_names', None)
+         self.output_dir = config.get('output_dir', None)
+         self.pc_range = torch.tensor(config.get('point_cloud_range', None))
++        self.fusion_mode = config.get('fusion_mode', 'radar_only')
++        self.gate_distance_bins = config.get('gate_distance_bins', [15.0, 30.0])
++        self.image_branch_config = config.get('image_branch', None)
++        self.image_scale_dims = None
++        self.topk_keep_points = config.get('topk_keep_points', None)
++        self.topk_feature_index = config.get('topk_feature_index', 3)
++        self.distillation_config = config.get('distillation', None)
++        self.temporal_encoder_config = config.get('temporal_encoder', {})
++        self.bev_fusion_config = config.get('bev_fusion', {})
++        self.geometry_aux_config = config.get('geometry_aux', {})
++        self.camera_prior_config = config.get('camera_prior', {})
++        self.radar_bev_attention_config = config.get('radar_bev_attention', {})
++        self.object_densifier_config = config.get('object_densifier', {})
++        self.__dict__['_teacher_model'] = None
++        configured_camera_prior_tasks = self.camera_prior_config.get('task_names', None)
++        if configured_camera_prior_tasks is None:
++            self.camera_prior_task_names = None
++        else:
++            self.camera_prior_task_names = set(configured_camera_prior_tasks)
+         
+         voxel_layer_config = config.get('pts_voxel_layer', None)
+         voxel_encoder_config = config.get('voxel_encoder', None)
+@@ -40,6 +71,7 @@ class CenterPoint(L.LightningModule):
+         backbone_config = config.get('backbone', None)
+         neck_config = config.get('neck', None)
+         head_config = config.get('head', None)
++        image_branch_config = self.image_branch_config
+         
+         self.voxel_layer = Voxelization(**voxel_layer_config)
+         self.voxel_encoder = PillarFeatureNet(**voxel_encoder_config)
+@@ -47,6 +79,166 @@ class CenterPoint(L.LightningModule):
+         self.backbone = SECOND(**backbone_config)
+         self.neck = SECONDFPN(**neck_config)
+         self.head = CenterHead(**head_config)
++        self.temporal_encoder = None
++        if self.temporal_encoder_config.get('enabled', False):
++            self.temporal_encoder = TemporalRadarEncoder(
++                in_channels=voxel_encoder_config['in_channels'],
++                hidden_dim=self.temporal_encoder_config.get('hidden_dim', 32),
++                feature_indices=self.temporal_encoder_config.get('feature_indices', (3, 4, 5, 6)),
++                residual_scale=self.temporal_encoder_config.get('residual_scale', 1.0),
++            )
++        self.use_bev_fusion = bool(self.bev_fusion_config.get('enabled', False))
++        self.use_geometry_aux = bool(self.geometry_aux_config.get('enabled', False))
++        self.use_camera_prior = bool(self.camera_prior_config.get('enabled', False))
++        self.use_radar_bev_attention = bool(self.radar_bev_attention_config.get('enabled', False))
++        self.use_object_densifier = bool(self.object_densifier_config.get('enabled', False))
++        self.neck_out_channels = int(head_config['in_channels'])
++        self.middle_out_channels = int(middle_encoder_config['in_channels'])
++
++        self.use_image_features = self.fusion_mode != 'radar_only'
++        if self.use_image_features:
++            if image_branch_config is None:
++                raise ValueError('image_branch config is required for image fusion.')
++
++            if self.fusion_mode == 'image_sampling_freeze':
++                trainable_stage = 'none'
++            elif self.fusion_mode == 'image_sampling_finetune_layer3':
++                trainable_stage = 'layer3'
++            else:
++                raise ValueError(f'Unsupported fusion_mode: {self.fusion_mode}')
++
++            self.image_backbone = ResNet18Layer3(
++                pretrained=image_branch_config.get('pretrained', True),
++                trainable_stage=trainable_stage,
++                freeze_bn=image_branch_config.get('freeze_bn', False),
++                feature_layer=image_branch_config.get('feature_layer', 'layer3'),
++            )
++            feature_layer = image_branch_config.get('feature_layer', 'layer3')
++            if feature_layer == 'layer2_layer3':
++                self.image_scale_dims = [128, 256]
++            else:
++                self.image_scale_dims = [self.image_backbone.out_channels]
++            self.image_scatter = DynamicScatter(
++                voxel_size=voxel_layer_config['voxel_size'],
++                point_cloud_range=voxel_layer_config['point_cloud_range'],
++                average_points=True,
++            )
++            self.point_fusion = PointGatedFusion(
++                radar_dim=voxel_encoder_config['feat_channels'][-1],
++                image_dim=self.image_backbone.out_channels,
++                hidden_dim=image_branch_config.get(
++                    'fusion_hidden_dim',
++                    voxel_encoder_config['feat_channels'][-1],
++                ),
++                image_scale_dims=self.image_scale_dims,
++                context_dim=2 if image_branch_config.get('use_context_gate', False) else 0,
++                structured_fusion=image_branch_config.get('structured_fusion', False),
++            )
++            if self.use_bev_fusion:
++                bev_hidden = self.bev_fusion_config.get('hidden_channels', 128)
++                self.image_bev_projector = nn.Linear(
++                    self.image_backbone.out_channels,
++                    self.middle_out_channels,
++                )
++                self.image_bev_adapter = nn.Sequential(
++                    nn.Conv2d(self.middle_out_channels, self.neck_out_channels, kernel_size=3, padding=1, bias=False),
++                    nn.BatchNorm2d(self.neck_out_channels),
++                    nn.ReLU(inplace=True),
++                )
++                self.bev_fusion = BEVGatedFusion(
++                    radar_channels=self.neck_out_channels,
++                    image_channels=self.neck_out_channels,
++                    hidden_channels=bev_hidden,
++                )
++            else:
++                self.image_bev_projector = None
++                self.image_bev_adapter = None
++                self.bev_fusion = None
++            if self.use_camera_prior:
++                prior_hidden = int(self.camera_prior_config.get('hidden_channels', 64))
++                prior_scale = float(self.camera_prior_config.get('prior_scale', 0.5))
++                self.camera_prior_scale = prior_scale
++                self.camera_prior_stem = nn.Sequential(
++                    nn.Conv2d(self.neck_out_channels, prior_hidden, kernel_size=3, padding=1, bias=False),
++                    nn.BatchNorm2d(prior_hidden),
++                    nn.ReLU(inplace=True),
++                )
++                self.camera_prior_heads = nn.ModuleList(
++                    [
++                        nn.Conv2d(prior_hidden, task_cfg['num_class'], kernel_size=1)
++                        for task_cfg in head_config['tasks']
++                    ]
++                )
++            else:
++                self.camera_prior_scale = 0.0
++                self.camera_prior_stem = None
++                self.camera_prior_heads = None
++            self.register_buffer(
++                'image_mean',
++                torch.tensor(
++                    image_branch_config.get(
++                        'image_mean',
++                        [0.485, 0.456, 0.406],
++                    ),
++                    dtype=torch.float32,
++                ).view(1, 3, 1, 1),
++                persistent=False,
++            )
++            self.register_buffer(
++                'image_std',
++                torch.tensor(
++                    image_branch_config.get(
++                        'image_std',
++                        [0.229, 0.224, 0.225],
++                    ),
++                    dtype=torch.float32,
++                ).view(1, 3, 1, 1),
++                persistent=False,
++            )
++        else:
++            self.image_backbone = None
++            self.image_scatter = None
++            self.point_fusion = None
++            self.image_bev_projector = None
++            self.image_bev_adapter = None
++            self.bev_fusion = None
++            self.camera_prior_scale = 0.0
++            self.camera_prior_stem = None
++            self.camera_prior_heads = None
++            self.register_buffer(
++                'image_mean',
++                torch.zeros((1, 3, 1, 1), dtype=torch.float32),
++                persistent=False,
++            )
++            self.register_buffer(
++                'image_std',
++                torch.ones((1, 3, 1, 1), dtype=torch.float32),
++                persistent=False,
++            )
++
++        self.geometry_aux_head = None
++        if self.use_geometry_aux:
++            self.geometry_aux_head = GeometryAuxHead(
++                in_channels=self.neck_out_channels,
++                hidden_channels=self.geometry_aux_config.get('hidden_channels', 128),
++                out_channels=2,
++            )
++        self.radar_bev_attention = None
++        if self.use_radar_bev_attention:
++            self.radar_bev_attention = RadarBEVSelfAttention(
++                in_channels=self.neck_out_channels,
++                num_heads=int(self.radar_bev_attention_config.get('num_heads', 4)),
++                reduction=int(self.radar_bev_attention_config.get('reduction', 4)),
++                ffn_ratio=float(self.radar_bev_attention_config.get('ffn_ratio', 2.0)),
++                dropout=float(self.radar_bev_attention_config.get('dropout', 0.0)),
++            )
++        self.object_densifier = None
++        if self.use_object_densifier:
++            self.object_densifier = RadarObjectDensifier(
++                in_channels=voxel_encoder_config['in_channels'],
++                hidden_channels=int(self.object_densifier_config.get('hidden_channels', 64)),
++                num_virtual_points=int(self.object_densifier_config.get('num_virtual_points', 64)),
++            )
+         
+         self.optimizer_config = config.get('optimizer', None)
+         
+@@ -57,13 +249,52 @@ class CenterPoint(L.LightningModule):
+         self.inference_mode = config.get('inference_mode', 'val')
+         self.save_results = config.get('save_preds_results', False)
+         self.val_results_list =[]
++        self.latest_pillar_gate_strengths = None
++        self.latest_bev_gate_strengths = None
++        self.latest_pillar_coors = None
++        self.latest_pillar_num_points = None
++        self._reset_gate_stats()
+         
+     ## Voxelization
+     def voxelize(self, points):
+         voxel_dict = dict()
+         voxels, coors, num_points = [], [], []
+         for i, res in enumerate(points):
+-            res_voxels, res_coors, res_num_points = self.voxel_layer(res.cuda())
++            res_voxels, res_coors, res_num_points = self.voxel_layer(
++                res.to(self.device)
++            )
++            if (
++                self.topk_keep_points is not None
++                and res_voxels.shape[0] > 0
++                and self.topk_keep_points < res_voxels.shape[1]
++            ):
++                valid_counts = torch.clamp(res_num_points, max=res_voxels.shape[1])
++                point_scores = res_voxels[:, :, self.topk_feature_index]
++                point_ids = torch.arange(
++                    res_voxels.shape[1],
++                    device=res_voxels.device,
++                ).unsqueeze(0)
++                valid_mask = point_ids < valid_counts.unsqueeze(1)
++                masked_scores = point_scores.masked_fill(~valid_mask, float('-inf'))
++                topk_idx = torch.topk(
++                    masked_scores,
++                    k=self.topk_keep_points,
++                    dim=1,
++                    largest=True,
++                    sorted=True,
++                ).indices
++                gather_idx = topk_idx.unsqueeze(-1).expand(
++                    -1, -1, res_voxels.size(-1)
++                )
++                res_voxels = torch.gather(res_voxels, 1, gather_idx)
++                res_num_points = torch.clamp(
++                    res_num_points,
++                    max=self.topk_keep_points,
++                )
++            res_voxels = self._apply_temporal_encoding_to_voxels(
++                res_voxels,
++                res_num_points,
++            )
+             res_coors = F.pad(res_coors, (1, 0), mode='constant', value=i)
+             voxels.append(res_voxels)
+             coors.append(res_coors)
+@@ -78,29 +309,1034 @@ class CenterPoint(L.LightningModule):
+         voxel_dict['coors'] = coors
+ 
+         return voxel_dict
++
++    def _reset_gate_stats(self):
++        self.gate_stats = {
++            'global_sum': 0.0,
++            'global_sq_sum': 0.0,
++            'global_count': 0,
++            'global_low_count': 0,
++            'global_high_count': 0,
++            'class_sum': {name: 0.0 for name in self.class_names or []},
++            'class_count': {name: 0 for name in self.class_names or []},
++            'distance_sum': {'near': 0.0, 'mid': 0.0, 'far': 0.0},
++            'distance_count': {'near': 0, 'mid': 0, 'far': 0},
++        }
++
++    def _extract_image_features(self, images):
++        batch_images = torch.stack(images, dim=0).to(self.device)
++        if not torch.is_floating_point(batch_images):
++            batch_images = batch_images.float().div(255.0)
++        elif batch_images.max() > 1.0:
++            batch_images = batch_images / 255.0
++        batch_images = (batch_images - self.image_mean) / self.image_std
++        return self.image_backbone(batch_images)
++
++    def _sample_point_image_features(
++        self,
++        points,
++        feature_map,
++        image_shape,
++        points_to_cam,
++        camera_proj,
++    ):
++        if points.numel() == 0:
++            return feature_map.new_zeros((0, feature_map.shape[0]))
++
++        points = points.to(self.device)
++        points_to_cam = points_to_cam.to(self.device)
++        camera_proj = camera_proj.to(self.device)
++        num_points = points.shape[0]
++
++        points_homo = torch.cat(
++            [
++                points[:, :3],
++                torch.ones((num_points, 1), device=self.device, dtype=points.dtype),
++            ],
++            dim=1,
++        )
++        points_camera = points_homo @ points_to_cam.T
++        projected = points_camera @ camera_proj.T
++
++        depth = projected[:, 2]
++        safe_depth = torch.where(
++            depth.abs() < 1e-6,
++            torch.full_like(depth, 1e-6),
++            depth,
++        )
++        uv = projected[:, :2] / safe_depth.unsqueeze(1)
++
++        image_h, image_w = image_shape
++        valid_mask = (
++            (depth > 0)
++            & (uv[:, 0] >= 0)
++            & (uv[:, 0] <= image_w - 1)
++            & (uv[:, 1] >= 0)
++            & (uv[:, 1] <= image_h - 1)
++        )
++
++        x_norm = (uv[:, 0] / max(image_w - 1, 1)) * 2 - 1
++        y_norm = (uv[:, 1] / max(image_h - 1, 1)) * 2 - 1
++        grid = torch.stack([x_norm, y_norm], dim=-1).view(1, num_points, 1, 2)
++
++        sampled = F.grid_sample(
++            feature_map.unsqueeze(0),
++            grid,
++            mode='bilinear',
++            padding_mode='zeros',
++            align_corners=True,
++        )
++        sampled = sampled.squeeze(0).squeeze(-1).transpose(0, 1)
++        sampled[~valid_mask] = 0
++
++        return sampled
++
++    def _sample_batch_point_image_features(
++        self,
++        pts_data,
++        images,
++        points_to_cams,
++        camera_projs,
++    ):
++        if not self.use_image_features:
++            return None
++
++        image_features = self._extract_image_features(images)
++        sampled_point_features = []
++        multi_scale = isinstance(image_features, (tuple, list))
++        for sample_idx, (points, image, points_to_cam, camera_proj) in enumerate(
++            zip(pts_data, images, points_to_cams, camera_projs)
++        ):
++            if multi_scale:
++                sampled_parts = []
++                for feature_map in image_features:
++                    sampled_parts.append(
++                        self._sample_point_image_features(
++                            points=points,
++                            feature_map=feature_map[sample_idx],
++                            image_shape=image.shape[-2:],
++                            points_to_cam=points_to_cam,
++                            camera_proj=camera_proj,
++                        )
++                    )
++                sampled_image = torch.cat(sampled_parts, dim=-1)
++            else:
++                sampled_image = self._sample_point_image_features(
++                    points=points,
++                    feature_map=image_features[sample_idx],
++                    image_shape=image.shape[-2:],
++                    points_to_cam=points_to_cam,
++                    camera_proj=camera_proj,
++                )
++            sampled_point_features.append(sampled_image)
++
++        return sampled_point_features
++
++    def _align_dynamic_to_hard_voxels(self, dynamic_features, dynamic_coors, hard_coors):
++        if hard_coors.shape[0] == 0:
++            return dynamic_features.new_zeros((0, dynamic_features.shape[1]))
++
++        dynamic_coors_cpu = dynamic_coors.detach().cpu().tolist()
++        hard_coors_cpu = hard_coors.detach().cpu().tolist()
++        dynamic_index = {tuple(coor): idx for idx, coor in enumerate(dynamic_coors_cpu)}
++
++        aligned = dynamic_features.new_zeros((hard_coors.shape[0], dynamic_features.shape[1]))
++        matched_indices = []
++        matched_rows = []
++        for row_idx, coor in enumerate(hard_coors_cpu):
++            feature_idx = dynamic_index.get(tuple(coor))
++            if feature_idx is not None:
++                matched_rows.append(row_idx)
++                matched_indices.append(feature_idx)
++
++        if matched_indices:
++            matched_rows = torch.tensor(matched_rows, device=aligned.device, dtype=torch.long)
++            matched_indices = torch.tensor(matched_indices, device=aligned.device, dtype=torch.long)
++            aligned[matched_rows] = dynamic_features[matched_indices]
++
++        return aligned
++
++    def _aggregate_image_features_to_pillars(self, pts_data, sampled_point_features, hard_coors):
++        if not self.use_image_features:
++            return None
++
++        batch_pillar_features = []
++        for batch_idx, (points, point_image_features) in enumerate(zip(pts_data, sampled_point_features)):
++            sample_hard_mask = hard_coors[:, 0] == batch_idx
++            sample_hard_coors = hard_coors[sample_hard_mask][:, 1:]
++
++            if sample_hard_coors.shape[0] == 0:
++                batch_pillar_features.append(
++                    point_image_features.new_zeros((0, point_image_features.shape[1]))
++                )
++                continue
++
++            sample_dynamic_coors = voxelization(
++                points.to(self.device),
++                self.voxel_layer.voxel_size,
++                self.voxel_layer.point_cloud_range,
++                -1,
++                -1,
++                self.voxel_layer.deterministic,
++            )
++            dynamic_features, dynamic_coors = self.image_scatter(
++                point_image_features,
++                sample_dynamic_coors,
++            )
++            aligned_features = self._align_dynamic_to_hard_voxels(
++                dynamic_features=dynamic_features,
++                dynamic_coors=dynamic_coors,
++                hard_coors=sample_hard_coors,
++            )
++            batch_pillar_features.append(aligned_features)
++
++        return torch.cat(batch_pillar_features, dim=0)
++
++    def _apply_temporal_encoding_to_voxels(self, voxels, num_points):
++        if self.temporal_encoder is None or voxels.numel() == 0:
++            return voxels
++
++        encoded_voxels = voxels.clone()
++        max_points = encoded_voxels.shape[1]
++        point_ids = torch.arange(max_points, device=encoded_voxels.device).unsqueeze(0)
++        valid_mask = point_ids < num_points.unsqueeze(1)
++        flat_valid = valid_mask.reshape(-1)
++        if not flat_valid.any():
++            return encoded_voxels
++
++        flat_voxels = encoded_voxels.reshape(-1, encoded_voxels.shape[-1])
++        flat_voxels[flat_valid] = self.temporal_encoder(flat_voxels[flat_valid])
++        return flat_voxels.view_as(encoded_voxels)
++
++    def _fuse_pillar_features(self, radar_pillar_features, image_pillar_features):
++        pillar_context = self._build_pillar_fusion_context(
++            self.latest_pillar_coors,
++            self.latest_pillar_num_points,
++        )
++        fused_features, gate = self.point_fusion(
++            radar_pillar_features,
++            image_pillar_features,
++            context_features=pillar_context,
++        )
++        gate_strength = gate.mean(dim=1)
++        self.latest_pillar_gate_strengths = gate_strength
++        return fused_features
++
++    def _build_image_bev_guidance(self, image_pillar_features, coors, batch_size):
++        if not self.use_bev_fusion or image_pillar_features is None or image_pillar_features.shape[0] == 0:
++            return None
++        projected_image = self.image_bev_projector(image_pillar_features)
++        image_bev = self.middle_encoder(projected_image, coors, batch_size)
++        return self.image_bev_adapter(image_bev)
++
++    def _build_pillar_fusion_context(self, coors, num_points):
++        if coors is None or num_points is None:
++            return None
++
++        vx = float(self.voxel_layer.voxel_size[0])
++        vy = float(self.voxel_layer.voxel_size[1])
++        x_min = float(self.voxel_layer.point_cloud_range[0])
++        y_min = float(self.voxel_layer.point_cloud_range[1])
++        x_max = float(self.voxel_layer.point_cloud_range[3])
++        y_max = float(self.voxel_layer.point_cloud_range[4])
++
++        centers_x = coors[:, 3].float() * vx + x_min + vx / 2
++        centers_y = coors[:, 2].float() * vy + y_min + vy / 2
++        distance = torch.sqrt(centers_x.square() + centers_y.square())
++        max_distance = float((x_max ** 2 + max(abs(y_min), abs(y_max)) ** 2) ** 0.5)
++        distance = distance / max(max_distance, 1e-6)
++
++        max_points = max(float(self.voxel_layer.max_num_points), 1.0)
++        density = num_points.float() / max_points
++        return torch.stack([distance, density], dim=-1)
++
++    def _bbox_results_to_cpu(self, bbox_results):
++        cpu_results = []
++        for result in bbox_results:
++            cpu_results.append(
++                dict(
++                    bboxes_3d=result['bboxes_3d'].to('cpu'),
++                    scores_3d=result['scores_3d'].detach().cpu(),
++                    labels_3d=result['labels_3d'].detach().cpu(),
++                )
++            )
++        return cpu_results
++
++    def _update_gate_stats(self, gt_bboxes_3d, gt_labels_3d):
++        if not self.use_image_features or self.latest_pillar_gate_strengths is None:
++            return
++
++        vx = self.voxel_layer.voxel_size[0]
++        vy = self.voxel_layer.voxel_size[1]
++        vz = self.voxel_layer.voxel_size[2]
++        x_min, y_min, z_min = self.voxel_layer.point_cloud_range[:3]
++        device = self.device
++
++        for batch_idx, (boxes_3d, labels_3d) in enumerate(zip(
++            gt_bboxes_3d,
++            gt_labels_3d,
++        )):
++            sample_mask = self.latest_pillar_coors[:, 0] == batch_idx
++            sample_coors = self.latest_pillar_coors[sample_mask]
++            gate_strengths = self.latest_pillar_gate_strengths[sample_mask].detach().cpu()
++            if gate_strengths.numel() == 0:
++                continue
++
++            self.gate_stats['global_sum'] += gate_strengths.sum().item()
++            self.gate_stats['global_sq_sum'] += gate_strengths.square().sum().item()
++            self.gate_stats['global_count'] += int(gate_strengths.numel())
++            self.gate_stats['global_low_count'] += int((gate_strengths < 0.1).sum().item())
++            self.gate_stats['global_high_count'] += int((gate_strengths > 0.9).sum().item())
++
++            pillar_centers = torch.stack(
++                [
++                    sample_coors[:, 3].float() * vx + x_min + vx / 2,
++                    sample_coors[:, 2].float() * vy + y_min + vy / 2,
++                    sample_coors[:, 1].float() * vz + z_min + vz / 2,
++                ],
++                dim=1,
++            )
++            points_xyz = pillar_centers.unsqueeze(0).to(device)
++            boxes_tensor = boxes_3d.tensor[:, :7].unsqueeze(0).to(self.device)
++            point_box_indices = points_in_boxes_gpu(points_xyz, boxes_tensor).squeeze(0).detach().cpu()
++            labels_cpu = labels_3d.detach().cpu()
++            box_centers = boxes_3d.gravity_center.detach().cpu()
++
++            assigned_mask = point_box_indices >= 0
++            if not assigned_mask.any():
++                continue
++
++            assigned_box_indices = point_box_indices[assigned_mask].long()
++            assigned_gate_strengths = gate_strengths[assigned_mask]
++
++            for class_idx, class_name in enumerate(self.class_names):
++                class_mask = labels_cpu[assigned_box_indices] == class_idx
++                if class_mask.any():
++                    class_gate = assigned_gate_strengths[class_mask]
++                    self.gate_stats['class_sum'][class_name] += class_gate.sum().item()
++                    self.gate_stats['class_count'][class_name] += int(class_gate.numel())
++
++            distances = torch.norm(box_centers[assigned_box_indices][:, :2], dim=1)
++            near_mask = distances < self.gate_distance_bins[0]
++            mid_mask = (distances >= self.gate_distance_bins[0]) & (distances < self.gate_distance_bins[1])
++            far_mask = distances >= self.gate_distance_bins[1]
++
++            for bucket_name, bucket_mask in (
++                ('near', near_mask),
++                ('mid', mid_mask),
++                ('far', far_mask),
++            ):
++                if bucket_mask.any():
++                    bucket_gate = assigned_gate_strengths[bucket_mask]
++                    self.gate_stats['distance_sum'][bucket_name] += bucket_gate.sum().item()
++                    self.gate_stats['distance_count'][bucket_name] += int(bucket_gate.numel())
++
++    def _log_gate_stats(self):
++        total_count = self.gate_stats['global_count']
++        if total_count == 0:
++            return
++
++        mean = self.gate_stats['global_sum'] / total_count
++        variance = max(self.gate_stats['global_sq_sum'] / total_count - mean * mean, 0.0)
++        std = variance ** 0.5
++        low_ratio = self.gate_stats['global_low_count'] / total_count
++        high_ratio = self.gate_stats['global_high_count'] / total_count
++
++        self.log('validation/gate/global_mean', mean, batch_size=1, sync_dist=True)
++        self.log('validation/gate/global_std', std, batch_size=1, sync_dist=True)
++        self.log('validation/gate/low_ratio', low_ratio, batch_size=1, sync_dist=True)
++        self.log('validation/gate/high_ratio', high_ratio, batch_size=1, sync_dist=True)
++
++        for class_name in self.class_names:
++            count = self.gate_stats['class_count'][class_name]
++            if count > 0:
++                value = self.gate_stats['class_sum'][class_name] / count
++                self.log(
++                    f'validation/gate/class_{class_name.lower()}_mean',
++                    value,
++                    batch_size=1,
++                    sync_dist=True,
++                )
++
++        for bucket_name in ('near', 'mid', 'far'):
++            count = self.gate_stats['distance_count'][bucket_name]
++            if count > 0:
++                value = self.gate_stats['distance_sum'][bucket_name] / count
++                self.log(
++                    f'validation/gate/distance_{bucket_name}_mean',
++                    value,
++                    batch_size=1,
++                    sync_dist=True,
++                )
++
++    def _subsample_points(self, points, max_points, feature_index=None):
++        if points.shape[0] <= max_points:
++            return points
++        if feature_index is not None and points.shape[1] > feature_index:
++            scores = points[:, feature_index]
++            keep_idx = torch.topk(scores, k=max_points, largest=True, sorted=False).indices
++            return points[keep_idx]
++        perm = torch.randperm(points.shape[0], device=points.device)[:max_points]
++        return points[perm]
++
++    def _pad_radar_crop(self, points, max_points, feature_dim):
++        padded = points.new_zeros((max_points, feature_dim))
++        mask = torch.zeros((max_points,), dtype=torch.bool, device=points.device)
++        if points.numel() == 0:
++            return padded, mask
++        num = min(points.shape[0], max_points)
++        padded[:num] = points[:num]
++        mask[:num] = True
++        return padded, mask
++
++    def _rotate_points_along_z(self, points_xyz, yaw):
++        cos_yaw = torch.cos(yaw)
++        sin_yaw = torch.sin(yaw)
++        x = points_xyz[:, 0]
++        y = points_xyz[:, 1]
++        rotated_x = cos_yaw * x - sin_yaw * y
++        rotated_y = sin_yaw * x + cos_yaw * y
++        return torch.stack((rotated_x, rotated_y, points_xyz[:, 2]), dim=-1)
++
++    def _to_box_local_points(self, points, box_center, box_dims, box_yaw, normalize=True):
++        local_points = points.clone()
++        local_xyz = local_points[:, :3] - box_center.unsqueeze(0)
++        local_xyz = self._rotate_points_along_z(local_xyz, -box_yaw)
++        if normalize:
++            half_dims = (box_dims * 0.5).clamp_min(1e-2)
++            local_xyz = local_xyz / half_dims.unsqueeze(0)
++        local_points[:, :3] = local_xyz
++        return local_points
++
++    def _from_box_local_xyz(self, local_xyz, box_center, box_dims, box_yaw, normalize=True):
++        global_xyz = local_xyz
++        if normalize:
++            half_dims = (box_dims * 0.5).clamp_min(1e-2)
++            global_xyz = global_xyz * half_dims.unsqueeze(0)
++        global_xyz = self._rotate_points_along_z(global_xyz, box_yaw)
++        global_xyz = global_xyz + box_center.unsqueeze(0)
++        return global_xyz
++
++    def _get_object_densifier_schedule(self):
++        warmup_epochs = int(self.object_densifier_config.get('warmup_epochs', 0))
++        append_after_warmup = bool(self.object_densifier_config.get('append_after_warmup', False))
++        if warmup_epochs <= 0:
++            return 1.0, True
++        progress = min(float(self.current_epoch + 1) / float(warmup_epochs), 1.0)
++        allow_append = (not append_after_warmup) or progress >= 1.0
++        return progress, allow_append
++
++    def _build_virtual_point_features(self, virtual_xyz, radar_crop):
++        feature_dim = radar_crop.shape[1]
++        virtual_points = virtual_xyz.new_zeros((virtual_xyz.shape[0], feature_dim))
++        virtual_points[:, :3] = virtual_xyz
++        if feature_dim > 3:
++            extra_mode = self.object_densifier_config.get('append_feature_mode', 'mean')
++            if radar_crop.shape[0] > 0 and extra_mode == 'mean':
++                extra = radar_crop[:, 3:].mean(dim=0, keepdim=True)
++                virtual_points[:, 3:] = extra.expand(virtual_xyz.shape[0], -1)
++        return virtual_points
++
++    def _chamfer_l2_loss(self, pred_xyz, target_xyz):
++        if pred_xyz.numel() == 0 or target_xyz.numel() == 0:
++            return pred_xyz.new_tensor(0.0)
++        dist_matrix = torch.cdist(pred_xyz.unsqueeze(0), target_xyz.unsqueeze(0), p=2).squeeze(0)
++        pred_to_target = dist_matrix.min(dim=1).values
++        target_to_pred = dist_matrix.min(dim=0).values
++        return pred_to_target.square().mean() + target_to_pred.square().mean()
++
++    def _apply_object_densifier_augmentation(self, pts_data, teacher_pts_data, gt_bboxes_3d):
++        if not self.use_object_densifier or self.object_densifier is None:
++            return pts_data, None
++
++        max_radar_points = int(self.object_densifier_config.get('max_radar_points', 96))
++        max_lidar_points = int(self.object_densifier_config.get('max_lidar_points', 512))
++        min_radar_points = int(self.object_densifier_config.get('min_radar_points', 1))
++        min_lidar_points = int(self.object_densifier_config.get('min_lidar_points', 8))
++        detach_virtual_points = bool(self.object_densifier_config.get('detach_virtual_points', True))
++        append_virtual_points = bool(self.object_densifier_config.get('append_virtual_points', True))
++        normalize_local_xyz = bool(self.object_densifier_config.get('normalize_local_xyz', True))
++        radar_feature_index = 3 if pts_data and pts_data[0].shape[1] > 3 else None
++        densifier_scale, allow_append = self._get_object_densifier_schedule()
++        append_virtual_points = append_virtual_points and allow_append
++
++        densifier_crops = []
++        densifier_masks = []
++        densifier_centers = []
++        densifier_dims = []
++        densifier_yaws = []
++        densifier_targets = []
++        crop_metadata = []
++        augmented_pts = [sample_pts.clone() for sample_pts in pts_data]
++
++        for batch_idx, (sample_pts, teacher_pts, boxes_3d) in enumerate(zip(pts_data, teacher_pts_data, gt_bboxes_3d)):
++            if teacher_pts is None or boxes_3d.tensor.shape[0] == 0:
++                continue
++
++            boxes_tensor = boxes_3d.tensor[:, :7].to(self.device).contiguous()
++            radar_xyz = sample_pts[:, :3].to(self.device).unsqueeze(0).contiguous()
++            lidar_xyz = teacher_pts[:, :3].to(self.device).unsqueeze(0).contiguous()
++            boxes_batch = boxes_tensor.unsqueeze(0)
++
++            radar_box_indices = points_in_boxes_gpu(radar_xyz, boxes_batch).squeeze(0)
++            lidar_box_indices = points_in_boxes_gpu(lidar_xyz, boxes_batch).squeeze(0)
++
++            sample_pts_device = sample_pts.to(self.device)
++            teacher_pts_device = teacher_pts.to(self.device)
++            for obj_idx in range(boxes_tensor.shape[0]):
++                radar_mask = radar_box_indices == obj_idx
++                lidar_mask = lidar_box_indices == obj_idx
++                radar_crop = sample_pts_device[radar_mask]
++                lidar_crop = teacher_pts_device[lidar_mask][:, :3]
++
++                if radar_crop.shape[0] < min_radar_points or lidar_crop.shape[0] < min_lidar_points:
++                    continue
++
++                radar_crop = self._subsample_points(
++                    radar_crop,
++                    max_points=max_radar_points,
++                    feature_index=radar_feature_index,
++                )
++                lidar_crop = self._subsample_points(
++                    lidar_crop,
++                    max_points=max_lidar_points,
++                    feature_index=None,
++                )
++
++                padded_crop, crop_mask = self._pad_radar_crop(
++                    radar_crop,
++                    max_points=max_radar_points,
++                    feature_dim=sample_pts.shape[1],
++                )
++                densifier_crops.append(padded_crop)
++                densifier_masks.append(crop_mask)
++                densifier_centers.append(boxes_tensor[obj_idx, :3])
++                densifier_dims.append(boxes_tensor[obj_idx, 3:6].clamp_min(1e-2))
++                densifier_yaws.append(boxes_tensor[obj_idx, 6])
++                densifier_targets.append(lidar_crop)
++                crop_metadata.append((batch_idx, radar_crop))
++
++        if not densifier_crops:
++            return pts_data, pts_data[0].new_tensor(0.0)
++
++        densifier_crops = torch.stack(densifier_crops, dim=0)
++        densifier_masks = torch.stack(densifier_masks, dim=0)
++        densifier_centers = torch.stack(densifier_centers, dim=0)
++        densifier_dims = torch.stack(densifier_dims, dim=0)
++        densifier_yaws = torch.stack(densifier_yaws, dim=0)
++
++        for obj_idx in range(densifier_crops.shape[0]):
++            densifier_crops[obj_idx] = self._to_box_local_points(
++                densifier_crops[obj_idx],
++                box_center=densifier_centers[obj_idx],
++                box_dims=densifier_dims[obj_idx],
++                box_yaw=densifier_yaws[obj_idx],
++                normalize=normalize_local_xyz,
++            )
++            densifier_targets[obj_idx] = self._to_box_local_points(
++                densifier_targets[obj_idx],
++                box_center=densifier_centers[obj_idx],
++                box_dims=densifier_dims[obj_idx],
++                box_yaw=densifier_yaws[obj_idx],
++                normalize=normalize_local_xyz,
++            )[:, :3]
++
++        pred_virtual_local_xyz = self.object_densifier(
++            radar_crops=densifier_crops,
++            crop_mask=densifier_masks,
++        )
++
++        aug_loss = pred_virtual_local_xyz.new_tensor(0.0)
++        for obj_idx, target_xyz in enumerate(densifier_targets):
++            aug_loss = aug_loss + self._chamfer_l2_loss(pred_virtual_local_xyz[obj_idx], target_xyz)
++
++            if append_virtual_points:
++                virtual_xyz = self._from_box_local_xyz(
++                    pred_virtual_local_xyz[obj_idx],
++                    box_center=densifier_centers[obj_idx],
++                    box_dims=densifier_dims[obj_idx],
++                    box_yaw=densifier_yaws[obj_idx],
++                    normalize=normalize_local_xyz,
++                )
++                if detach_virtual_points:
++                    virtual_xyz = virtual_xyz.detach()
++                radar_crop = crop_metadata[obj_idx][1]
++                virtual_points = self._build_virtual_point_features(virtual_xyz, radar_crop)
++                sample_idx = crop_metadata[obj_idx][0]
++                augmented_pts[sample_idx] = torch.cat(
++                    [augmented_pts[sample_idx], virtual_points.to(augmented_pts[sample_idx].device)],
++                    dim=0,
++                )
++
++        aug_loss = densifier_scale * aug_loss / max(len(densifier_targets), 1)
++        return augmented_pts, aug_loss
++
++    @property
++    def teacher_model(self):
++        return self.__dict__.get('_teacher_model')
++
++    def _distillation_enabled(self):
++        return bool(self.distillation_config and self.distillation_config.get('enabled', False))
++
++    def _resolve_local_path(self, path_str):
++        path = Path(path_str)
++        if path.is_absolute():
++            return path
++        return Path(os.getcwd()) / path
++
++    def _rewrite_teacher_config_interpolations(self, cfg_node):
++        if isinstance(cfg_node, dict):
++            return {
++                key: self._rewrite_teacher_config_interpolations(value)
++                for key, value in cfg_node.items()
++            }
++
++        if isinstance(cfg_node, list):
++            return [
++                self._rewrite_teacher_config_interpolations(value)
++                for value in cfg_node
++            ]
++
++        if isinstance(cfg_node, str):
++            return cfg_node.replace('${model.', '${')
++
++        return cfg_node
++
++    def _load_teacher_config(self):
++        teacher_config_path = self.distillation_config.get('teacher_config_path', None)
++        if teacher_config_path is None:
++            raise ValueError('distillation.teacher_config_path is required when distillation is enabled.')
++
++        teacher_cfg = OmegaConf.load(self._resolve_local_path(teacher_config_path))
++        teacher_cfg = OmegaConf.to_container(teacher_cfg, resolve=False)
++        teacher_cfg = self._rewrite_teacher_config_interpolations(teacher_cfg)
++        teacher_cfg = OmegaConf.create(teacher_cfg)
++        teacher_cfg['exp_id'] = f"{self.hparams.config.get('exp_id', 'teacher')}_teacher"
++        teacher_cfg['data_root'] = self.data_root
++        teacher_cfg['output_dir'] = self.output_dir
++        OmegaConf.resolve(teacher_cfg)
++        teacher_cfg = OmegaConf.to_container(teacher_cfg, resolve=True)
++        teacher_cfg.pop('distillation', None)
++        return teacher_cfg
++
++    def _build_teacher_model(self):
++        if not self._distillation_enabled():
++            return None
++
++        teacher_checkpoint_path = self.distillation_config.get('teacher_checkpoint_path', None)
++        if not teacher_checkpoint_path:
++            raise ValueError(
++                'distillation.teacher_checkpoint_path is required when distillation is enabled.'
++            )
++
++        teacher_cfg = self._load_teacher_config()
++        teacher_model = CenterPoint(teacher_cfg)
++        checkpoint = torch.load(
++            self._resolve_local_path(teacher_checkpoint_path),
++            map_location='cpu',
++            weights_only=False,
++        )
++        state_dict = checkpoint.get('state_dict', checkpoint)
++        state_dict = self._upgrade_legacy_shared_conv_state_dict(
++            state_dict,
++            teacher_model,
++        )
++        teacher_model.load_state_dict(state_dict, strict=True)
++        teacher_model.eval()
++        for param in teacher_model.parameters():
++            param.requires_grad = False
++
++        return teacher_model.to(self.device)
++
++    @staticmethod
++    def _upgrade_legacy_shared_conv_state_dict(state_dict, model):
++        """Map pre-main shared_conv keys to the new nn.Sequential layout."""
++        target_keys = model.state_dict().keys()
++        expects_sequential = any(
++            key.startswith('head.shared_conv.0.') for key in target_keys
++        )
++        has_legacy_keys = any(
++            key.startswith('head.shared_conv.conv.')
++            or key.startswith('head.shared_conv.BN2d.')
++            for key in state_dict.keys()
++        )
++
++        if not expects_sequential or not has_legacy_keys:
++            return state_dict
++
++        upgraded = {}
++        for key, value in state_dict.items():
++            if key.startswith('head.shared_conv.'):
++                suffix = key[len('head.shared_conv.'):]
++                if not suffix.startswith('0.'):
++                    key = f'head.shared_conv.0.{suffix}'
++            upgraded[key] = value
++        return upgraded
++
++    def _get_teacher_model(self):
++        if self.teacher_model is None:
++            self.__dict__['_teacher_model'] = self._build_teacher_model()
++        return self.teacher_model
++
++    def _build_gt_bev_mask(self, gt_bboxes_3d, spatial_shape, device):
++        height, width = spatial_shape
++        mask = torch.zeros((len(gt_bboxes_3d), 1, height, width), device=device)
++
++        x_min = float(self.pc_range[0].item())
++        y_min = float(self.pc_range[1].item())
++        x_max = float(self.pc_range[3].item())
++        y_max = float(self.pc_range[4].item())
++        x_span = max(x_max - x_min, 1e-6)
++        y_span = max(y_max - y_min, 1e-6)
++
++        for batch_idx, boxes_3d in enumerate(gt_bboxes_3d):
++            bev_boxes = boxes_3d.nearest_bev.to(device)
++            if bev_boxes.numel() == 0:
++                continue
++
++            for bev_box in bev_boxes:
++                x1, y1, x2, y2 = bev_box.tolist()
++                x1_idx = int(np.floor((x1 - x_min) / x_span * width))
++                x2_idx = int(np.ceil((x2 - x_min) / x_span * width))
++                y1_idx = int(np.floor((y1 - y_min) / y_span * height))
++                y2_idx = int(np.ceil((y2 - y_min) / y_span * height))
++
++                x1_idx = min(max(x1_idx, 0), width - 1)
++                y1_idx = min(max(y1_idx, 0), height - 1)
++                x2_idx = min(max(x2_idx, x1_idx + 1), width)
++                y2_idx = min(max(y2_idx, y1_idx + 1), height)
++                mask[batch_idx, 0, y1_idx:y2_idx, x1_idx:x2_idx] = 1.0
++
++        return mask
++
++    def _compute_distillation_loss(self, student_feature, teacher_feature, gt_bboxes_3d):
++        mask_mode = self.distillation_config.get('mask_mode', 'gt_boxes')
++        if mask_mode != 'gt_boxes':
++            raise ValueError(f'Unsupported distillation mask_mode: {mask_mode}')
++
++        if teacher_feature.shape[1] != student_feature.shape[1]:
++            raise ValueError(
++                'Teacher and student feature channels must match for distillation. '
++                f'Got {teacher_feature.shape[1]} and {student_feature.shape[1]}.'
++            )
++
++        if teacher_feature.shape[-2:] != student_feature.shape[-2:]:
++            teacher_feature = F.interpolate(
++                teacher_feature,
++                size=student_feature.shape[-2:],
++                mode='bilinear',
++                align_corners=False,
++            )
++
++        mask = self._build_gt_bev_mask(
++            gt_bboxes_3d=gt_bboxes_3d,
++            spatial_shape=student_feature.shape[-2:],
++            device=student_feature.device,
++        )
++        mask_sum = mask.sum()
++        if mask_sum.item() == 0:
++            return student_feature.new_tensor(0.0)
++
++        loss_type = self.distillation_config.get('loss_type', 'l1')
++        if loss_type == 'l1':
++            per_element_loss = F.l1_loss(student_feature, teacher_feature, reduction='none')
++        elif loss_type == 'smooth_l1':
++            per_element_loss = F.smooth_l1_loss(student_feature, teacher_feature, reduction='none')
++        else:
++            raise ValueError(f'Unsupported distillation loss_type: {loss_type}')
++
++        masked_loss = per_element_loss * mask
++        normalizer = mask_sum * student_feature.shape[1]
++        return masked_loss.sum() / normalizer.clamp_min(1.0)
++
++    def _build_lidar_geometry_targets(self, teacher_pts_data, spatial_shape, device):
++        height, width = spatial_shape
++        occupancy = torch.zeros((len(teacher_pts_data), 1, height, width), device=device)
++        density = torch.zeros((len(teacher_pts_data), 1, height, width), device=device)
++
++        x_min = float(self.pc_range[0].item())
++        y_min = float(self.pc_range[1].item())
++        x_max = float(self.pc_range[3].item())
++        y_max = float(self.pc_range[4].item())
++        x_span = max(x_max - x_min, 1e-6)
++        y_span = max(y_max - y_min, 1e-6)
++        max_density = float(self.geometry_aux_config.get('max_density', 16.0))
++
++        for batch_idx, teacher_points in enumerate(teacher_pts_data):
++            if teacher_points is None or teacher_points.numel() == 0:
++                continue
++
++            pts = teacher_points[:, :3].to(device)
++            valid_mask = (
++                (pts[:, 0] >= x_min)
++                & (pts[:, 0] < x_max)
++                & (pts[:, 1] >= y_min)
++                & (pts[:, 1] < y_max)
++            )
++            pts = pts[valid_mask]
++            if pts.numel() == 0:
++                continue
++
++            x_idx = torch.floor((pts[:, 0] - x_min) / x_span * width).long()
++            y_idx = torch.floor((pts[:, 1] - y_min) / y_span * height).long()
++            x_idx = x_idx.clamp(0, width - 1)
++            y_idx = y_idx.clamp(0, height - 1)
++
++            flat_idx = y_idx * width + x_idx
++            counts = torch.bincount(flat_idx, minlength=height * width).float().view(height, width)
++            occupancy[batch_idx, 0] = (counts > 0).float()
++            density[batch_idx, 0] = torch.clamp(
++                torch.log1p(counts) / np.log1p(max_density),
++                min=0.0,
++                max=1.0,
++            )
++
++        return occupancy, density
++
++    def _build_geometry_roi_mask(self, spatial_shape, device):
++        height, width = spatial_shape
++        roi_cfg = self.geometry_aux_config.get('roi_aware', {})
++        if not roi_cfg.get('enabled', False):
++            return None
++
++        x_min = float(self.pc_range[0].item())
++        y_min = float(self.pc_range[1].item())
++        x_max = float(self.pc_range[3].item())
++        y_max = float(self.pc_range[4].item())
++
++        roi_x_range = roi_cfg.get('x_range', [x_min, x_max])
++        roi_y_range = roi_cfg.get('y_range', [y_min, y_max])
++        if roi_x_range is None:
++            roi_x_range = [x_min, x_max]
++        if roi_y_range is None:
++            roi_y_range = [y_min, y_max]
++
++        roi_x_min, roi_x_max = float(roi_x_range[0]), float(roi_x_range[1])
++        roi_y_min, roi_y_max = float(roi_y_range[0]), float(roi_y_range[1])
++
++        x_centers = torch.linspace(
++            x_min + (x_max - x_min) / (2 * width),
++            x_max - (x_max - x_min) / (2 * width),
++            width,
++            device=device,
++        )
++        y_centers = torch.linspace(
++            y_min + (y_max - y_min) / (2 * height),
++            y_max - (y_max - y_min) / (2 * height),
++            height,
++            device=device,
++        )
++        yy, xx = torch.meshgrid(y_centers, x_centers, indexing='ij')
++        roi_mask = (
++            (xx >= roi_x_min)
++            & (xx <= roi_x_max)
++            & (yy >= roi_y_min)
++            & (yy <= roi_y_max)
++        )
++        return roi_mask.unsqueeze(0).unsqueeze(0).float()
++
++    def _compute_geometry_aux_loss(self, geometry_logits, teacher_pts_data):
++        if geometry_logits is None:
++            raise ValueError('geometry_aux is enabled, but geometry logits are missing.')
++
++        target_occ, target_density = self._build_lidar_geometry_targets(
++            teacher_pts_data=teacher_pts_data,
++            spatial_shape=geometry_logits.shape[-2:],
++            device=geometry_logits.device,
++        )
++
++        pred_occ = geometry_logits[:, :1]
++        pred_density = torch.sigmoid(geometry_logits[:, 1:2])
++
++        roi_mask = self._build_geometry_roi_mask(
++            spatial_shape=geometry_logits.shape[-2:],
++            device=geometry_logits.device,
++        )
++        if roi_mask is None:
++            pixel_weights = torch.ones_like(target_occ)
++        else:
++            outside_weight = float(
++                self.geometry_aux_config.get('roi_aware', {}).get('outside_weight', 0.0)
++            )
++            pixel_weights = roi_mask.expand_as(target_occ)
++            if outside_weight != 0.0:
++                pixel_weights = pixel_weights + (1.0 - pixel_weights) * outside_weight
++
++        pos_count = (target_occ * pixel_weights).sum()
++        neg_count = ((1.0 - target_occ) * pixel_weights).sum()
++        pos_weight = geometry_logits.new_tensor(float(neg_count / pos_count.clamp_min(1.0)))
++        occ_loss_map = F.binary_cross_entropy_with_logits(
++            pred_occ,
++            target_occ,
++            pos_weight=pos_weight,
++            reduction='none',
++        )
++        occ_loss = (occ_loss_map * pixel_weights).sum() / pixel_weights.sum().clamp_min(1.0)
++
++        occupied_mask = target_occ > 0
++        if occupied_mask.any():
++            density_weights = pixel_weights[occupied_mask]
++            density_loss_map = F.smooth_l1_loss(
++                pred_density[occupied_mask],
++                target_density[occupied_mask],
++                reduction='none',
++            )
++            density_loss = (density_loss_map * density_weights).sum() / density_weights.sum().clamp_min(1.0)
++        else:
++            density_loss = pred_density.new_tensor(0.0)
++
++        occ_weight = float(self.geometry_aux_config.get('occupancy_weight', 1.0))
++        density_weight = float(self.geometry_aux_config.get('density_weight', 1.0))
++        return occ_weight * occ_loss + density_weight * density_loss
++
++    def _apply_camera_prior(self, preds_dicts, image_bev_guidance):
++        if (
++            not self.use_camera_prior
++            or image_bev_guidance is None
++            or self.camera_prior_stem is None
++            or self.camera_prior_heads is None
++        ):
++            return preds_dicts
++
++        prior_feature = image_bev_guidance
++        sample_heatmap = preds_dicts[0][0]['heatmap']
++        target_size = sample_heatmap.shape[-2:]
++        if prior_feature.shape[-2:] != target_size:
++            prior_feature = F.interpolate(
++                prior_feature,
++                size=target_size,
++                mode='bilinear',
++                align_corners=False,
++            )
++        prior_feature = self.camera_prior_stem(prior_feature)
++        for task_id, prior_head in enumerate(self.camera_prior_heads):
++            task_names = self.head.class_names[task_id]
++            if (
++                self.camera_prior_task_names is not None
++                and not any(task_name in self.camera_prior_task_names for task_name in task_names)
++            ):
++                continue
++            prior_logits = prior_head(prior_feature)
++            preds_dicts[task_id][0]['heatmap'] = (
++                preds_dicts[task_id][0]['heatmap']
++                + self.camera_prior_scale * prior_logits
++            )
++        return preds_dicts
+     
+-    def _model_forward(self, pts_data):
++    def _model_forward(
++        self,
++        pts_data,
++        images=None,
++        points_to_cams=None,
++        camera_projs=None,
++        return_features=False,
++    ):
++        sampled_point_features = self._sample_batch_point_image_features(
++            pts_data=pts_data,
++            images=images,
++            points_to_cams=points_to_cams,
++            camera_projs=camera_projs,
++        )
+ 
+         voxel_dict = self.voxelize(pts_data)
+     
+         voxels = voxel_dict['voxels']
+         num_points = voxel_dict['num_points']
+         coors = voxel_dict['coors']
++        bs = coors[-1,0].item() + 1
+     
+         voxel_features = self.voxel_encoder(voxels, num_points, coors)
+-        bs = coors[-1,0].item() + 1
++        image_bev_guidance = None
++        if self.use_image_features:
++            self.latest_pillar_coors = coors.detach()
++            self.latest_pillar_num_points = num_points.detach()
++            image_pillar_features = self._aggregate_image_features_to_pillars(
++                pts_data=pts_data,
++                sampled_point_features=sampled_point_features,
++                hard_coors=coors,
++            )
++            voxel_features = self._fuse_pillar_features(
++                radar_pillar_features=voxel_features,
++                image_pillar_features=image_pillar_features,
++            )
++            image_bev_guidance = self._build_image_bev_guidance(
++                image_pillar_features=image_pillar_features,
++                coors=coors,
++                batch_size=bs,
++            )
++        else:
++            self.latest_pillar_gate_strengths = None
++            self.latest_bev_gate_strengths = None
++            self.latest_pillar_coors = None
++            self.latest_pillar_num_points = None
++
+         bev_feats = self.middle_encoder(voxel_features, coors, bs)        
+         backbone_feats = self.backbone(bev_feats)
+         neck_feats = self.neck(backbone_feats)
++        neck_feature = neck_feats[0]
++        if self.radar_bev_attention is not None:
++            neck_feature = self.radar_bev_attention(neck_feature)
++        if image_bev_guidance is not None and self.bev_fusion is not None:
++            if image_bev_guidance.shape[-2:] != neck_feature.shape[-2:]:
++                image_bev_guidance = F.interpolate(
++                    image_bev_guidance,
++                    size=neck_feature.shape[-2:],
++                    mode='bilinear',
++                    align_corners=False,
++                )
++            neck_feature, bev_gate = self.bev_fusion(neck_feature, image_bev_guidance)
++            self.latest_bev_gate_strengths = bev_gate.mean(dim=1)
++        else:
++            self.latest_bev_gate_strengths = None
++
++        neck_feats = [neck_feature]
++        geometry_aux_logits = self.geometry_aux_head(neck_feature) if self.geometry_aux_head is not None else None
+         ret_dict = self.head(neck_feats)
+-        return ret_dict
++        ret_dict = self._apply_camera_prior(
++            preds_dicts=ret_dict,
++            image_bev_guidance=image_bev_guidance,
++        )
++        if not return_features:
++            return ret_dict
++
++        feature_dict = {
++            'bev': bev_feats,
++            'backbone_last': backbone_feats[-1],
++            'neck': neck_feature,
++            'geometry_aux': geometry_aux_logits,
++        }
++        return ret_dict, feature_dict
+     
+     def training_step(self, batch, batch_idx):
+         pts_data = batch['pts']
++        teacher_pts_data = batch.get('teacher_pts', None)
++        images = batch['imgs']
++        points_to_cams = batch['points_to_cams']
++        camera_projs = batch['camera_projs']
+         gt_label_3d = batch['gt_labels_3d']
+         gt_bboxes_3d = batch['gt_bboxes_3d']
++
++        densified_pts_data = pts_data
++        if self.use_object_densifier:
++            if teacher_pts_data is None or any(points is None for points in teacher_pts_data):
++                raise ValueError(
++                    'object_densifier is enabled, but the training batch does not include teacher_pts.'
++                )
++            densified_pts_data, object_densifier_loss = self._apply_object_densifier_augmentation(
++                pts_data=pts_data,
++                teacher_pts_data=teacher_pts_data,
++                gt_bboxes_3d=gt_bboxes_3d,
++            )
++        else:
++            object_densifier_loss = None
+         
+-        ret_dict = self._model_forward(pts_data)
++        ret_dict, feature_dict = self._model_forward(
++            densified_pts_data,
++            images=images,
++            points_to_cams=points_to_cams,
++            camera_projs=camera_projs,
++            return_features=True,
++        )
+         loss_input = [gt_bboxes_3d, gt_label_3d, ret_dict]
+         
+         losses = self.head.loss(*loss_input)
+@@ -108,8 +1344,55 @@ class CenterPoint(L.LightningModule):
+         log_vars = OrderedDict()
+         for loss_name, loss_value in losses.items():
+             log_vars[loss_name] = loss_value.mean()
++
++        if self._distillation_enabled():
++            if teacher_pts_data is None or any(points is None for points in teacher_pts_data):
++                raise ValueError(
++                    'Distillation is enabled, but the training batch does not include teacher_pts.'
++                )
++
++            teacher_model = self._get_teacher_model()
++            feature_name = self.distillation_config.get('feature_name', 'neck')
++            with torch.no_grad():
++                _, teacher_feature_dict = teacher_model._model_forward(
++                    teacher_pts_data,
++                    return_features=True,
++                )
++            distill_loss = self._compute_distillation_loss(
++                student_feature=feature_dict[feature_name],
++                teacher_feature=teacher_feature_dict[feature_name],
++                gt_bboxes_3d=gt_bboxes_3d,
++            )
++            log_vars['distill_loss'] = distill_loss
++
++        if self.use_geometry_aux:
++            if teacher_pts_data is None or any(points is None for points in teacher_pts_data):
++                raise ValueError(
++                    'geometry_aux is enabled, but the training batch does not include teacher_pts.'
++                )
++            geometry_aux_loss = self._compute_geometry_aux_loss(
++                geometry_logits=feature_dict.get('geometry_aux'),
++                teacher_pts_data=teacher_pts_data,
++            )
++            log_vars['geometry_aux_loss'] = geometry_aux_loss
++
++        if object_densifier_loss is not None:
++            log_vars['object_densifier_loss'] = object_densifier_loss
+         
+-        loss = sum(_value for _key, _value in log_vars.items() if 'loss' in _key)
++        loss = sum(
++            _value
++            for _key, _value in log_vars.items()
++            if 'loss' in _key and _key not in {'distill_loss', 'geometry_aux_loss', 'object_densifier_loss'}
++        )
++        if 'distill_loss' in log_vars:
++            distill_weight = self.distillation_config.get('weight', 1.0)
++            loss = loss + distill_weight * log_vars['distill_loss']
++        if 'geometry_aux_loss' in log_vars:
++            geometry_weight = float(self.geometry_aux_config.get('loss_weight', 1.0))
++            loss = loss + geometry_weight * log_vars['geometry_aux_loss']
++        if 'object_densifier_loss' in log_vars:
++            densifier_weight = float(self.object_densifier_config.get('loss_weight', 1.0))
++            loss = loss + densifier_weight * log_vars['object_densifier_loss']
+         log_vars['loss'] = loss
+         for loss_name, loss_value in log_vars.items():
+             # reduce loss when distributed training
+@@ -122,18 +1405,64 @@ class CenterPoint(L.LightningModule):
+         return loss
+     
+     def configure_optimizers(self):
+-        optimizer = torch.optim.AdamW(self.parameters(), **self.optimizer_config)
++        base_lr = self.optimizer_config['lr']
++        weight_decay = self.optimizer_config.get('weight_decay', 0.0)
++
++        if (
++            self.use_image_features
++            and self.fusion_mode == 'image_sampling_finetune_layer3'
++            and self.image_backbone is not None
++        ):
++            backbone_lr_mult = self.image_branch_config.get('backbone_lr_mult', 1.0)
++            backbone_param_ids = {
++                id(param)
++                for param in self.image_backbone.parameters()
++                if param.requires_grad
++            }
++            backbone_params = [
++                param for param in self.image_backbone.parameters()
++                if param.requires_grad
++            ]
++            main_params = [
++                param for param in self.parameters()
++                if param.requires_grad and id(param) not in backbone_param_ids
++            ]
++
++            optimizer = torch.optim.AdamW(
++                [
++                    {
++                        'params': main_params,
++                        'lr': base_lr,
++                        'weight_decay': weight_decay,
++                    },
++                    {
++                        'params': backbone_params,
++                        'lr': base_lr * backbone_lr_mult,
++                        'weight_decay': weight_decay,
++                    },
++                ]
++            )
++        else:
++            optimizer = torch.optim.AdamW(self.parameters(), **self.optimizer_config)
+         return optimizer
+     
+     
+     def validation_step(self, batch, batch_idx):
+         assert len(batch['pts']) == 1, 'Batch size should be 1 for validation'
+         pts_data = batch['pts']
++        images = batch['imgs']
++        points_to_cams = batch['points_to_cams']
++        camera_projs = batch['camera_projs']
+         metas = batch['metas']
+         gt_label_3d = batch['gt_labels_3d']
+         gt_bboxes_3d = batch['gt_bboxes_3d']
+         
+-        ret_dict = self._model_forward(pts_data)
++        ret_dict = self._model_forward(
++            pts_data,
++            images=images,
++            points_to_cams=points_to_cams,
++            camera_projs=camera_projs,
++        )
+         loss_input = [gt_bboxes_3d, gt_label_3d, ret_dict]
+         
+         bbox_list = self.head.get_bboxes(ret_dict, img_metas=metas)
+@@ -144,8 +1473,10 @@ class CenterPoint(L.LightningModule):
+                  labels_3d = labels)
+             for bboxes, scores, labels in bbox_list
+         ]
++        bbox_results = self._bbox_results_to_cpu(bbox_results)
+ 
+         losses = self.head.loss(*loss_input)
++        self._update_gate_stats(gt_bboxes_3d, gt_label_3d)
+         
+         log_vars = OrderedDict()
+         for loss_name, loss_value in losses.items():
+@@ -163,10 +1494,12 @@ class CenterPoint(L.LightningModule):
+         # task0.loss_heatmap', 'task0.loss_bbox', 'task1.loss_heatmap', 'task1.loss_bbox', 'task2.loss_heatmap', 'task2.loss_bbox', 'loss'
+         self.val_results_list.append(dict(
+             sample_idx = batch['metas'][0]['num_frame'],
+-            input_batch = batch,
+             bbox_results = bbox_results,
+             losses = log_vars
+         ))
++
++    def on_validation_epoch_start(self):
++        self._reset_gate_stats()
+     
+     def on_validation_epoch_end(self):
+         if (not self.save_results) or self.training: 
+@@ -181,6 +1514,7 @@ class CenterPoint(L.LightningModule):
+         
+         outputs = self.val_results_list
+         self.val_results_list = []
++        self._log_gate_stats()
+         results = self.format_results(outputs, results_save_path=preds_dst)
+         
+         if self.inference_mode =='val': 
+@@ -228,10 +1562,9 @@ class CenterPoint(L.LightningModule):
+         for result in outputs:
+             sample_idx = result['sample_idx']
+             res_dict = result['bbox_results']
+-            input_batch = result['input_batch']
+             
+             annos = []
+-            box_dict = self.convert_valid_bboxes(res_dict[0], input_batch)
++            box_dict = self.convert_valid_bboxes(res_dict[0], sample_idx)
+             
+             anno = {                 
+                 'name': [],
+@@ -312,13 +1645,12 @@ class CenterPoint(L.LightningModule):
+             print(f'Result is saved to {out}.')
+         return det_annos
+         
+-    def convert_valid_bboxes(self, box_dict, input_batch):
++    def convert_valid_bboxes(self, box_dict, sample_idx):
+         # Convert the predicted bounding boxes to the format required by the evaluation metric
+         # This function should be implemented based on the specific requirements of your dataset
+         box_preds = box_dict['bboxes_3d']
+         scores = box_dict['scores_3d']
+         labels = box_dict['labels_3d']
+-        sample_idx = input_batch['metas'][0]['num_frame']
+         
+         vod_frame_data = FrameDataLoader(kitti_locations=self.vod_kitti_locations, frame_number=sample_idx)
+         local_transforms = FrameTransformMatrix(vod_frame_data)
+@@ -394,4 +1726,4 @@ class CenterPoint(L.LightningModule):
+         
+         
+         
+-        
+\ No newline at end of file
++        

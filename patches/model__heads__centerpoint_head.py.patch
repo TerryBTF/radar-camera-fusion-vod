@@ -1,0 +1,246 @@
+diff --git a/src/model/heads/centerpoint_head.py b/src/model/heads/centerpoint_head.py
+index d629640..e4ef8c7 100644
+--- a/src/model/heads/centerpoint_head.py
++++ b/src/model/heads/centerpoint_head.py
+@@ -1,6 +1,7 @@
+ # Copyright (c) OpenMMLab. All rights reserved.
+ import copy
+ from typing import Dict, List, Optional, Tuple, Union
++from collections.abc import Sequence
+ import os.path as osp
+ 
+ import torch
+@@ -143,6 +144,7 @@ class CenterHead(nn.Module):
+                      init_bias=-2.19,
+                      final_kernel=3), # SeparateHead
+                  share_conv_channel: int = 64,
++                 share_conv_num_layers: int = 1,
+                  num_heatmap_convs: int = 2,
+                  bias: str = 'auto',
+                  norm_bbox: bool = True,
+@@ -164,14 +166,27 @@ class CenterHead(nn.Module):
+         self.bbox_coder = CenterPointBBoxCoder(**bbox_coder)
+         self.num_anchor_per_locs = [n for n in num_classes]
+ 
+-        # a shared convolution
+-        self.shared_conv = ConvModule(
+-            in_channels,
+-            share_conv_channel,
+-            kernel_size=3,
+-            padding=1,
+-            with_norm=True,
+-            bias=bias)
++        # Shared trunk before task-specific heads; depth is configurable.
++        assert share_conv_num_layers >= 1
++        shared_conv_layers = [
++            ConvModule(
++                in_channels,
++                share_conv_channel,
++                kernel_size=3,
++                padding=1,
++                with_norm=True,
++                bias=bias)
++        ]
++        for _ in range(share_conv_num_layers - 1):
++            shared_conv_layers.append(
++                ConvModule(
++                    share_conv_channel,
++                    share_conv_channel,
++                    kernel_size=3,
++                    padding=1,
++                    with_norm=True,
++                    bias=bias))
++        self.shared_conv = nn.Sequential(*shared_conv_layers)
+ 
+         self.task_heads = nn.ModuleList()
+         for num_cls in num_classes:
+@@ -268,8 +283,17 @@ class CenterHead(nn.Module):
+                         position of the valid boxes.
+                     - list[torch.Tensor]: Masks indicating which \
+                         boxes are valid.
++                    - list[torch.Tensor]: ROI-aware bbox weights.
++                    - list[torch.Tensor]: ROI-aware heatmap weights.
+         """
+-        heatmaps, anno_boxes, inds, masks = multi_apply(
++        (
++            heatmaps,
++            anno_boxes,
++            inds,
++            masks,
++            bbox_obj_weights,
++            heatmap_task_weights,
++        ) = multi_apply(
+             self.get_targets_single, gt_bboxes_3d, gt_labels_3d)
+         # Transpose heatmaps
+         heatmaps = list(map(list, zip(*heatmaps)))
+@@ -283,7 +307,18 @@ class CenterHead(nn.Module):
+         # Transpose inds
+         masks = list(map(list, zip(*masks)))
+         masks = [torch.stack(masks_) for masks_ in masks]
+-        return heatmaps, anno_boxes, inds, masks
++        bbox_obj_weights = list(map(list, zip(*bbox_obj_weights)))
++        bbox_obj_weights = [torch.stack(weights_) for weights_ in bbox_obj_weights]
++        heatmap_task_weights = list(map(list, zip(*heatmap_task_weights)))
++        heatmap_task_weights = [torch.stack(weights_) for weights_ in heatmap_task_weights]
++        return (
++            heatmaps,
++            anno_boxes,
++            inds,
++            masks,
++            bbox_obj_weights,
++            heatmap_task_weights,
++        )
+     
+     def get_targets_single(self, gt_bboxes_3d, gt_labels_3d):
+         """Generate training targets for a single sample.
+@@ -331,7 +366,21 @@ class CenterHead(nn.Module):
+             task_classes.append(torch.cat(task_class).long().to(device))
+ 
+         draw_gaussian = draw_heatmap_gaussian
++        roi_training_cfg = self.train_cfg.get('roi_aware_training', {})
++        roi_training_enabled = bool(roi_training_cfg.get('enabled', False))
++        roi_weight = float(roi_training_cfg.get('roi_weight', 1.0))
++        class_roi_weights_cfg = roi_training_cfg.get('class_weights', {}) or {}
++        apply_to_heatmap = bool(roi_training_cfg.get('apply_to_heatmap', True))
++        apply_to_bbox = bool(roi_training_cfg.get('apply_to_bbox', True))
++        roi_x_range = roi_training_cfg.get('x_range', [float(pc_range[0]), float(pc_range[3])])
++        roi_y_range = roi_training_cfg.get('y_range', [float(pc_range[1]), float(pc_range[4])])
++        if roi_x_range is None:
++            roi_x_range = [float(pc_range[0]), float(pc_range[3])]
++        if roi_y_range is None:
++            roi_y_range = [float(pc_range[1]), float(pc_range[4])]
++
+         heatmaps, anno_boxes, inds, masks = [], [], [], []
++        bbox_obj_weights, heatmap_task_weights = [], []
+ 
+         for idx, task_head in enumerate(self.task_heads):
+             heatmap = gt_bboxes_3d.new_zeros(
+@@ -342,6 +391,9 @@ class CenterHead(nn.Module):
+ 
+             ind = gt_labels_3d.new_zeros((max_objs), dtype=torch.int64)
+             mask = gt_bboxes_3d.new_zeros((max_objs), dtype=torch.uint8)
++            obj_weights = gt_bboxes_3d.new_ones((max_objs), dtype=torch.float32)
++            roi_obj_count = 0
++            valid_obj_count = 0
+ 
+             num_objs = min(task_boxes[idx].shape[0], max_objs)
+ 
+@@ -354,7 +406,16 @@ class CenterHead(nn.Module):
+ 
+                 if width > 0 and length > 0:
+                     radius = gaussian_radius((length, width), min_overlap=self.train_cfg['gaussian_overlap'])
+-                    radius = max(self.train_cfg['min_radius'], int(radius))
++                    use_classwise_min_radius = bool(self.train_cfg.get('use_classwise_min_radius', True))
++                    min_radius_cfg = self.train_cfg.get('min_radius', 2)
++                    if isinstance(min_radius_cfg, Sequence) and not isinstance(min_radius_cfg, (str, bytes)):
++                        if use_classwise_min_radius:
++                            min_radius = int(min_radius_cfg[idx])
++                        else:
++                            min_radius = int(min_radius_cfg[0])
++                    else:
++                        min_radius = int(min_radius_cfg)
++                    radius = max(min_radius, int(radius))
+ 
+                     # be really careful for the coordinate system of
+                     # your box annotation.
+@@ -384,6 +445,22 @@ class CenterHead(nn.Module):
+ 
+                     ind[new_idx] = y * feature_map_size[0] + x
+                     mask[new_idx] = 1
++                    valid_obj_count += 1
++                    if roi_training_enabled:
++                        x_world = float(task_boxes[idx][k][0].item())
++                        y_world = float(task_boxes[idx][k][1].item())
++                        in_roi = (
++                            roi_x_range[0] <= x_world <= roi_x_range[1]
++                            and roi_y_range[0] <= y_world <= roi_y_range[1]
++                        )
++                        class_name = self.class_names[idx][int(cls_id.item())]
++                        class_roi_weight = float(
++                            class_roi_weights_cfg.get(class_name, roi_weight)
++                        )
++                        if in_roi and apply_to_bbox:
++                            obj_weights[new_idx] = class_roi_weight
++                        if in_roi and apply_to_heatmap:
++                            roi_obj_count += max(0.0, class_roi_weight - 1.0)
+                     # TODO: support other outdoor dataset
+                     # vx, vy = 0, 0 # task_boxes[idx][k][7:]
+                     rot = task_boxes[idx][k][6]
+@@ -404,8 +481,16 @@ class CenterHead(nn.Module):
+             anno_boxes.append(anno_box)
+             masks.append(mask)
+             inds.append(ind)
+-            
+-        return heatmaps, anno_boxes, inds, masks
++            bbox_obj_weights.append(obj_weights)
++            if roi_training_enabled and apply_to_heatmap and valid_obj_count > 0:
++                avg_heatmap_boost = float(roi_obj_count / valid_obj_count)
++                heatmap_task_weights.append(
++                    heatmap.new_tensor(1.0 + avg_heatmap_boost)
++                )
++            else:
++                heatmap_task_weights.append(heatmap.new_tensor(1.0))
++
++        return heatmaps, anno_boxes, inds, masks, bbox_obj_weights, heatmap_task_weights
+     
+     def loss(self, gt_bboxes_3d, gt_labels_3d, preds_dicts, **kwargs):
+         """Loss function for CenterHead.
+@@ -420,11 +505,24 @@ class CenterHead(nn.Module):
+             dict[str:torch.Tensor]: Loss of heatmap and bbox of each task.
+         """
+ 
+-        heatmaps, anno_boxes, inds, masks = self.get_targets(gt_bboxes_3d, gt_labels_3d)
++        (
++            heatmaps,
++            anno_boxes,
++            inds,
++            masks,
++            bbox_obj_weights,
++            heatmap_task_weights,
++        ) = self.get_targets(gt_bboxes_3d, gt_labels_3d)
+ 
+ 
+         loss_dict = dict()
+         for task_id, preds_dict in enumerate(preds_dicts):
++            task_loss_weights = self.train_cfg.get('task_loss_weights', None)
++            task_weight = 1.0
++            if isinstance(task_loss_weights, Sequence) and not isinstance(task_loss_weights, (str, bytes)):
++                if task_id < len(task_loss_weights):
++                    task_weight = float(task_loss_weights[task_id])
++
+             # heatmap focal loss
+             preds_dict[0]['heatmap'] = clip_sigmoid(preds_dict[0]['heatmap'])
+             num_pos = heatmaps[task_id].eq(1).float().sum().item()
+@@ -434,6 +532,7 @@ class CenterHead(nn.Module):
+                 preds_dict[0]['heatmap'],
+                 heatmaps[task_id],
+                 avg_factor=max(num_pos, 1))
++            loss_heatmap = loss_heatmap * heatmap_task_weights[task_id].to(loss_heatmap.device)
+             target_box = anno_boxes[task_id]
+             # reconstruct the anno_box from multiple reg heads
+             preds_dict[0]['anno_box'] = torch.cat(
+@@ -452,13 +551,15 @@ class CenterHead(nn.Module):
+ 
+             code_weights = self.train_cfg.get('code_weights', None)
+             bbox_weights = mask * mask.new_tensor(code_weights)
++            obj_weight = bbox_obj_weights[task_id].unsqueeze(2).expand_as(target_box).float()
++            bbox_weights = bbox_weights * obj_weight
+             bbox_weights = bbox_weights.cuda()
+             pred = pred.cuda()
+             target_box = target_box.cuda()
+             loss_bbox = self.loss_bbox(
+                 pred, target_box, bbox_weights, avg_factor=(num + 1e-4))
+-            loss_dict[f'task{task_id}.loss_heatmap'] = loss_heatmap
+-            loss_dict[f'task{task_id}.loss_bbox'] = loss_bbox
++            loss_dict[f'task{task_id}.loss_heatmap'] = loss_heatmap * task_weight
++            loss_dict[f'task{task_id}.loss_bbox'] = loss_bbox * task_weight
+         return loss_dict
+ 
+     def get_bboxes(self, preds_dicts, img_metas, img=None, rescale=False):
+@@ -668,4 +769,4 @@ class CenterHead(nn.Module):
+                                        device=device))
+ 
+             predictions_dicts.append(predictions_dict)
+-        return predictions_dicts
+\ No newline at end of file
++        return predictions_dicts

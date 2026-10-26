@@ -1,0 +1,24 @@
+defaults:
+  - fusion_finetune_layer3_stable_radar_to_lidar_big3_roi_train_weight
+  - _self_
+
+exp_id: centerpoint_radar_gated_fusion_finetune_layer3_stable_radar_to_lidar_big3_roi_train_weight_object_densifier
+
+model:
+  geometry_aux:
+    enabled: false
+  object_densifier:
+    enabled: true
+    hidden_channels: 128
+    num_virtual_points: 96
+    max_radar_points: 96
+    max_lidar_points: 512
+    min_radar_points: 1
+    min_lidar_points: 8
+    normalize_local_xyz: true
+    detach_virtual_points: true
+    append_virtual_points: true
+    append_after_warmup: true
+    append_feature_mode: mean
+    warmup_epochs: 3
+    loss_weight: 0.1

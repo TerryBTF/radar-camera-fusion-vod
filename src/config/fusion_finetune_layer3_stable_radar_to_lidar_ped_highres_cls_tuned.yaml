@@ -1,0 +1,11 @@
+defaults:
+  - fusion_finetune_layer3_stable_radar_to_lidar_ped_highres
+  - _self_
+
+exp_id: centerpoint_radar_gated_fusion_finetune_layer3_stable_radar_to_lidar_main_struct_radar_changes_ped_highres_cls_tuned
+
+model:
+  head:
+    train_cfg:
+      min_radius: [4, 3, 2]
+      task_loss_weights: [1.0, 1.25, 1.0]

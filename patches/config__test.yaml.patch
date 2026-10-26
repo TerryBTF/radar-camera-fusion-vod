@@ -1,0 +1,11 @@
+diff --git a/src/config/test.yaml b/src/config/test.yaml
+index ca33fb3..0774b8d 100644
+--- a/src/config/test.yaml
++++ b/src/config/test.yaml
+@@ -1,5 +1,5 @@
+ defaults: 
+-  - model: centerpoint
++  - model: centerpoint_radar
+   - _self_
+ exp_id: centerpoint_default_test
+ 

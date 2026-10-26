@@ -1,0 +1,157 @@
+diff --git a/src/tools/train.py b/src/tools/train.py
+index eb5836e..d97cde2 100644
+--- a/src/tools/train.py
++++ b/src/tools/train.py
+@@ -1,6 +1,7 @@
+ import os
+ import sys
+ import os.path as osp
++import tempfile
+ root = os.path.abspath(os.path.join(os.getcwd()))
+ if root not in sys.path:
+     sys.path.insert(0, root)
+@@ -18,27 +19,99 @@ from torch.utils.data import DataLoader
+ from src.model.detector import CenterPoint
+ from src.dataset import ViewOfDelft, collate_vod_batch
+ 
++def _load_pretrained_student_weights(model, checkpoint_path):
++    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
++    state_dict = checkpoint.get('state_dict', checkpoint)
++    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
++
++    ignored_missing = {
++        key for key in missing_keys
++        if key.startswith('_teacher_model.')
++    }
++    remaining_missing = [key for key in missing_keys if key not in ignored_missing]
++
++    if remaining_missing or unexpected_keys:
++        raise RuntimeError(
++            'Warm-start student checkpoint is not compatible with current model. '
++            f'Missing keys: {remaining_missing}. Unexpected keys: {unexpected_keys}.'
++        )
++
+ @hydra.main(version_base=None, config_path='../config', config_name='train')    
+ def train(cfg: DictConfig)-> None:
+     L.seed_everything(cfg.seed, workers=True)
++    checkpoint_dir = osp.join(cfg.output_dir, "checkpoints")
++    output_parent_dir = osp.dirname(osp.abspath(cfg.output_dir))
++    local_tmp_dir = osp.join(output_parent_dir, ".tmp_pl")
++    os.makedirs(local_tmp_dir, exist_ok=True)
++    tempfile.tempdir = local_tmp_dir
++    os.environ["TMPDIR"] = local_tmp_dir
++
++    dataset_cfg = cfg.get('dataset', {})
++    point_source = dataset_cfg.get('point_source', 'radar')
++    radar_folder = dataset_cfg.get('radar_folder', 'radar')
++    load_image = dataset_cfg.get(
++        'load_image',
++        cfg.model.get('fusion_mode', 'radar_only') != 'radar_only',
++    )
++    transform_radar_to_lidar = dataset_cfg.get('transform_radar_to_lidar', True)
++    distill_cfg = cfg.model.get('distillation', {})
++    geometry_aux_cfg = cfg.model.get('geometry_aux', {})
++    object_densifier_cfg = cfg.model.get('object_densifier', {})
++    load_teacher_lidar = bool(
++        distill_cfg.get('enabled', False)
++        or geometry_aux_cfg.get('enabled', False)
++        or object_densifier_cfg.get('enabled', False)
++    )
++    dataloader_kwargs = {}
++    if cfg.num_workers > 0:
++        dataloader_kwargs['prefetch_factor'] = cfg.get('prefetch_factor', 1)
+     
+-    train_dataset = ViewOfDelft(data_root=cfg.data_root, split='train')
+-    val_dataset = ViewOfDelft(data_root=cfg.data_root, split='val')
++    train_dataset = ViewOfDelft(
++        data_root=cfg.data_root,
++        split='train',
++        point_source=point_source,
++        radar_folder=radar_folder,
++        load_image=load_image,
++        transform_radar_to_lidar=transform_radar_to_lidar,
++        load_teacher_lidar=load_teacher_lidar,
++    )
++    val_dataset = ViewOfDelft(
++        data_root=cfg.data_root,
++        split='val',
++        point_source=point_source,
++        radar_folder=radar_folder,
++        load_image=load_image,
++        transform_radar_to_lidar=transform_radar_to_lidar,
++        load_teacher_lidar=False,
++    )
+     
+     train_dataloader = DataLoader(train_dataset, 
+                                   batch_size=cfg.batch_size, 
+                                   num_workers=cfg.num_workers, 
+                                   shuffle=True,
+-                                  collate_fn=collate_vod_batch)
++                                  collate_fn=collate_vod_batch,
++                                  **dataloader_kwargs)
+     val_dataloader = DataLoader(val_dataset, 
+                                 batch_size=1, 
+                                 num_workers=cfg.num_workers, 
+                                 shuffle=False,
+-                                collate_fn=collate_vod_batch)
++                                collate_fn=collate_vod_batch,
++                                **dataloader_kwargs)
+     model = CenterPoint(cfg.model)
++
++    pretrained_student_checkpoint_path = cfg.get('pretrained_student_checkpoint_path', None)
++    if cfg.checkpoint_path and pretrained_student_checkpoint_path:
++        raise ValueError(
++            'Use either checkpoint_path (resume full training state) or '
++            'pretrained_student_checkpoint_path (warm-start weights only), not both.'
++        )
++    if pretrained_student_checkpoint_path:
++        _load_pretrained_student_weights(model, pretrained_student_checkpoint_path)
++        print(f'Warm-started student weights from {pretrained_student_checkpoint_path}')
++
+     callbacks = [
+         ModelCheckpoint(
+-            dirpath=osp.join(cfg.output_dir, "checkpoints"),
++            dirpath=checkpoint_dir,
+             filename='ep{epoch}-'+cfg.exp_id,
+             save_last=True,
+             monitor='validation/entire_area/mAP',
+@@ -48,13 +121,21 @@ def train(cfg: DictConfig)-> None:
+         ),
+         LearningRateMonitor(logging_interval="epoch")
+     ]
+-    logger = WandbLogger(
+-        save_dir=osp.join(cfg.output_dir, 'wandb_logs'),
+-        project='amp',
+-        name=cfg.exp_id,
+-        log_model=False,        
+-    )
+-    logger.watch(model, log_graph=False)
++    logger = None
++    if cfg.get('use_wandb', True):
++        os.environ.setdefault("WANDB_MODE", str(cfg.get('wandb_mode', 'offline')))
++        try:
++            logger = WandbLogger(
++                save_dir=osp.join(cfg.output_dir, 'wandb_logs'),
++                project='amp',
++                name=cfg.exp_id,
++                log_model=False,
++            )
++            if cfg.get('wandb_watch_model', False):
++                logger.watch(model, log_graph=False)
++        except Exception as exc:
++            print(f'WandbLogger disabled due to initialization error: {exc}')
++            logger = None
+         
+ 
+     
+@@ -75,7 +156,7 @@ def train(cfg: DictConfig)-> None:
+                 train_dataloaders=train_dataloader,
+                 val_dataloaders=val_dataloader,
+                 ckpt_path=cfg.checkpoint_path)
+-    wandb.finish()
++#    wandb.finish()
+     
+ if __name__ == '__main__':
+-    train()
+\ No newline at end of file
++    train()

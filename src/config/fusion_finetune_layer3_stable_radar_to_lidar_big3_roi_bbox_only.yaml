@@ -1,0 +1,16 @@
+defaults:
+  - fusion_finetune_layer3_stable_radar_to_lidar_big3
+  - _self_
+
+exp_id: centerpoint_radar_gated_fusion_finetune_layer3_stable_radar_to_lidar_big3_roi_bbox_only
+
+model:
+  head:
+    train_cfg:
+      roi_aware_training:
+        enabled: true
+        x_range: [0.0, 51.2]
+        y_range: [-10.0, 10.0]
+        roi_weight: 1.2
+        apply_to_heatmap: false
+        apply_to_bbox: true

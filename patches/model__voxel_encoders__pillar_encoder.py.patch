@@ -1,0 +1,40 @@
+diff --git a/src/model/voxel_encoders/pillar_encoder.py b/src/model/voxel_encoders/pillar_encoder.py
+index e92990d..b333b94 100644
+--- a/src/model/voxel_encoders/pillar_encoder.py
++++ b/src/model/voxel_encoders/pillar_encoder.py
+@@ -22,7 +22,8 @@ class PillarFeatureNet(nn.Module):
+             and y size. Defaults to (0.2, 0.2, 4).
+         point_cloud_range (tuple[float], optional): Point cloud range, only
+             utilizes x and y min. Defaults to (0, -40, -3, 70.4, 40, 1).
+-        mode (str, optional): The mode to gather point features. Options are
++        pool_mode (str, optional): The pooling mode to gather point features.
++            Options are
+             'max' or 'avg'. Defaults to 'max'.
+         legacy (bool): Whether to use the new behavior or
+             the original behavior. Defaults to True.
+@@ -36,11 +37,15 @@ class PillarFeatureNet(nn.Module):
+                  with_voxel_center=True,
+                  voxel_size=(0.2, 0.2, 4),
+                  point_cloud_range=(0, -40, -3, 70.4, 40, 1),
+-                 mode='max',
++                 pool_mode='max',
++                 mode=None,
+                  legacy=True):
+         super().__init__()
+         assert len(feat_channels) > 0
+         self.legacy = legacy
++        # `mode` is kept for backward compatibility with older configs.
++        if mode is not None:
++            pool_mode = mode
+         if with_cluster_center:
+             in_channels += 3
+         if with_voxel_center:
+@@ -67,7 +72,7 @@ class PillarFeatureNet(nn.Module):
+                     in_filters,
+                     out_filters,
+                     last_layer=last_layer,
+-                    mode=mode))
++                    pool_mode=pool_mode))
+         self.pfn_layers = nn.ModuleList(pfn_layers)
+ 
+         # Need pillar (voxel) size and x/y offset in order to calculate offset

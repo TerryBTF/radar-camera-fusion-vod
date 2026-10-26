@@ -1,0 +1,51 @@
+diff --git a/src/model/voxel_encoders/utils.py b/src/model/voxel_encoders/utils.py
+index d5cc592..e608205 100644
+--- a/src/model/voxel_encoders/utils.py
++++ b/src/model/voxel_encoders/utils.py
+@@ -109,7 +109,7 @@ class PFNLayer(nn.Module):
+         out_channels (int): Number of output channels.
+         last_layer (bool): If last_layer, there is no concatenation of
+             features.
+-        mode (str): Pooling model to gather features inside voxels.
++        pool_mode (str): Pooling mode to gather features inside voxels.
+             Default to 'max'.
+     """
+ 
+@@ -117,7 +117,8 @@ class PFNLayer(nn.Module):
+                  in_channels,
+                  out_channels,
+                  last_layer=False,
+-                 mode='max'):
++                 pool_mode='max',
++                 mode=None):
+ 
+         super().__init__()
+         self.fp16_enabled = False
+@@ -130,8 +131,11 @@ class PFNLayer(nn.Module):
+         self.norm = BatchNorm1d(out_channels, eps=1e-3, momentum=0.01) 
+         self.linear = nn.Linear(in_channels, self.units, bias=False)
+ 
+-        assert mode in ['max', 'avg']
+-        self.mode = mode
++        # `mode` is kept for backward compatibility with older configs.
++        if mode is not None:
++            pool_mode = mode
++        assert pool_mode in ['max', 'avg']
++        self.pool_mode = pool_mode
+ 
+     def forward(self, inputs, num_voxels=None, aligned_distance=None):
+         """Forward function.
+@@ -153,11 +157,11 @@ class PFNLayer(nn.Module):
+                                                                1).contiguous()
+         x = F.relu(x)
+ 
+-        if self.mode == 'max':
++        if self.pool_mode == 'max':
+             if aligned_distance is not None:
+                 x = x.mul(aligned_distance.unsqueeze(-1))
+             x_max = torch.max(x, dim=1, keepdim=True)[0]
+-        elif self.mode == 'avg':
++        elif self.pool_mode == 'avg':
+             if aligned_distance is not None:
+                 x = x.mul(aligned_distance.unsqueeze(-1))
+             x_max = x.sum(

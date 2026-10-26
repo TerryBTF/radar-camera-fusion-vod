@@ -1,0 +1,13 @@
+diff --git a/src/model/__init__.py b/src/model/__init__.py
+index ad7f754..ec23231 100644
+--- a/src/model/__init__.py
++++ b/src/model/__init__.py
+@@ -3,4 +3,6 @@ from .middle_encoders import PointPillarsScatter
+ from .backbones import SECOND
+ from .necks import SECONDFPN
+ from .heads import CenterHead
+-from .detector import CenterPoint
+\ No newline at end of file
++from .detector import CenterPoint
++from .image_backbones import ResNet18Layer3
++from .fusion import PointGatedFusion

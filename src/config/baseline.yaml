@@ -1,0 +1,75 @@
+# ============================================================================
+# BASELINE CONFIGURATION
+# ============================================================================
+# This is the ABSOLUTE BASELINE configuration for the radar-only CenterPoint.
+# All modifications should start from here and document the delta.
+# 
+# Baseline Name: centerpoint_radar_baseline
+# Date: 2026-03-18
+# Reference: baseline_result.md (ep5 best = 31.96 mAP entire area, 53.59 mAP ROI)
+#
+# CRITICAL: Do not modify this file without documenting the change.
+# Each new experiment should create a NEW config file.
+# ============================================================================
+
+defaults: 
+  - model: centerpoint_radar
+  - _self_
+
+# ============================================================================
+# RANDOM SEED & REPRODUCIBILITY
+# ============================================================================
+seed: 47020  # Fixed seed for reproducibility
+# Python RNG, NumPy, PyTorch, Lightning all use this seed
+
+# ============================================================================
+# EXPERIMENT IDENTIFICATION
+# ============================================================================
+exp_id: centerpoint_radar_baseline  # Unique identifier for this experiment
+
+# ============================================================================
+# DATA CONFIGURATION
+# ============================================================================
+data_root: data/view_of_delft
+output_dir: outputs/${exp_id}
+checkpoint_path: null  # Train from scratch
+
+class_names: ['Car', 'Pedestrian', 'Cyclist']
+
+# ============================================================================
+# TRAINING HYPERPARAMETERS - FROZEN BASELINE
+# ============================================================================
+batch_size: 4           # Batch size for training (from successful baseline run)
+num_workers: 2          # Data loading workers
+epochs: 12              # Total epochs (empirical: ep5 best, degraded after)
+                        # Fixed at 12 to allow validation at ep2, ep5, ep8, ep11
+
+# ============================================================================
+# VALIDATION & CHECKPOINTING
+# ============================================================================
+val_every: 3            # Validate every N epochs (at ep2, ep5, ep8, ep11)
+save_top_model: 5       # Keep top 5 checkpoints by mAP metric
+
+# ============================================================================
+# LOGGING
+# ============================================================================
+log_every: 50           # Log metrics every N steps
+
+# ============================================================================
+# HARDWARE
+# ============================================================================
+gpus: [0]               # Will be overridden in code to auto-detect all GPUs
+sync_bn: true           # Synchronize batch norm across GPUs
+
+# ============================================================================
+# EVALUATION METRICS (defined in model)
+# ============================================================================
+# Primary metrics:
+#   - validation/entire_area/mAP (full ROI)
+#   - validation/roi/mAP (driving corridor subset)
+#
+# Per-class metrics:
+#   - validation/entire_area/{Car,Pedestrian,Cyclist}_3d
+#   - validation/roi/{Car,Pedestrian,Cyclist}_3d
+#
+# Checkpoint selection: highest validation/entire_area/mAP (monitor metric)

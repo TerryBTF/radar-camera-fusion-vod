@@ -1,0 +1,26 @@
+defaults:
+  - model: centerpoint_radar_image_layer3
+  - _self_
+
+seed: 47020
+exp_id: centerpoint_radar_image_sampling_freeze
+
+data_root: data/view_of_delft
+output_dir: outputs/${exp_id}
+checkpoint_path: null
+
+class_names: ['Car', 'Pedestrian', 'Cyclist']
+
+batch_size: 4
+num_workers: 2
+epochs: 12
+
+val_every: 3
+save_top_model: 5
+log_every: 50
+
+gpus: [0]
+sync_bn: true
+
+model:
+  fusion_mode: image_sampling_freeze

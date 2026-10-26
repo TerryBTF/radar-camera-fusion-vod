@@ -1,0 +1,42 @@
+defaults:
+  - model: centerpoint_radar_image_layer3
+  - _self_
+
+seed: 47020
+exp_id: centerpoint_radar_gated_fusion_finetune_layer3_stable_radar_to_lidar_distill
+
+data_root: data/view_of_delft
+output_dir: outputs/${exp_id}
+checkpoint_path: null
+pretrained_student_checkpoint_path: null
+
+class_names: ['Car', 'Pedestrian', 'Cyclist']
+
+batch_size: 4
+num_workers: 2
+prefetch_factor: 1
+epochs: 12
+
+val_every: 3
+save_top_model: 5
+log_every: 50
+
+gpus: [0]
+sync_bn: true
+
+dataset:
+  transform_radar_to_lidar: true
+
+model:
+  fusion_mode: image_sampling_finetune_layer3
+  image_branch:
+    backbone_lr_mult: 0.1
+    freeze_bn: true
+  distillation:
+    enabled: true
+    feature_name: neck
+    mask_mode: gt_boxes
+    loss_type: l1
+    weight: 0.1
+    teacher_config_path: src/config/model/centerpoint.yaml
+    teacher_checkpoint_path: null

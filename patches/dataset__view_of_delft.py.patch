@@ -1,0 +1,189 @@
+diff --git a/src/dataset/view_of_delft.py b/src/dataset/view_of_delft.py
+index 3d27431..d9aea37 100644
+--- a/src/dataset/view_of_delft.py
++++ b/src/dataset/view_of_delft.py
+@@ -1,4 +1,5 @@
+ import os
++import re
+ import numpy as np
+ from src.model.utils import LiDARInstance3DBoxes
+ 
+@@ -34,13 +35,33 @@ class ViewOfDelft(Dataset):
+         'bbox3d_rotation': 14, # Rotation around -Z-axis in LiDAR coordinates [-pi..pi].
+     }
+     
++    @staticmethod
++    def _parse_multiframe_count(radar_folder):
++        match = re.fullmatch(r'radar_(\d+)frames', radar_folder)
++        if match is None:
++            return None
++        return int(match.group(1))
++
+     def __init__(self, 
+                  data_root = 'data/view_of_delft', 
+                  sequential_loading=False,
+-                 split = 'train'):
++                 split = 'train',
++                 point_source='radar',
++                 radar_folder='radar',
++                 load_image=True,
++                 transform_radar_to_lidar=True,
++                 load_teacher_lidar=False):
+         super().__init__()
+         
+         self.data_root = data_root
++        assert point_source in ['radar', 'lidar'], (
++            f"Invalid point_source: {point_source}. Must be one of ['radar', 'lidar']"
++        )
++        self.point_source = point_source
++        self.radar_folder = radar_folder
++        self.load_image = load_image
++        self.transform_radar_to_lidar = transform_radar_to_lidar
++        self.load_teacher_lidar = load_teacher_lidar
+         assert split in ['train', 'val', 'test'], f"Invalid split: {split}. Must be one of ['train', 'val', 'test']"
+         self.split = split
+         split_file = os.path.join(data_root, 'lidar', 'ImageSets', f'{split}.txt')
+@@ -50,6 +71,42 @@ class ViewOfDelft(Dataset):
+             self.sample_list = [line.strip() for line in lines]
+         
+         self.vod_kitti_locations = KittiLocations(root_dir = data_root)
++        self.vod_kitti_locations.radar_dir = os.path.join(
++            data_root,
++            radar_folder,
++            'training',
++            'velodyne',
++        )
++
++    def _apply_multiframe_radar_weighting(self, radar_data):
++        num_frames = self._parse_multiframe_count(self.radar_folder)
++        if num_frames is None or num_frames <= 1 or radar_data.shape[1] <= 6:
++            return radar_data
++
++        radar_data = radar_data.copy()
++        time_vals = radar_data[:, 6]
++        time_weights = np.ones_like(time_vals, dtype=np.float32)
++        normalized_time = np.ones_like(time_vals, dtype=np.float32)
++
++        max_history = max(0, num_frames - 1)
++        for history_idx in range(1, max_history + 1):
++            history_mask = time_vals == -float(history_idx)
++            if not np.any(history_mask):
++                continue
++            time_weights[history_mask] = max(0.1, 1.0 - 0.1 * history_idx)
++            normalized_time[history_mask] = max(
++                0.0,
++                1.0 - history_idx / max(max_history, 1),
++            )
++
++        # Preserve both raw and compensated radial velocity while softly
++        # downweighting older frames.
++        radar_data[:, 3] *= time_weights  # RCS
++        radar_data[:, 4] *= time_weights  # v_r
++        radar_data[:, 5] *= time_weights  # v_r_compensated
++        radar_data[:, 6] = normalized_time
++        return radar_data
++
+     def __len__(self):
+         return len(self.sample_list)
+ 
+@@ -59,9 +116,43 @@ class ViewOfDelft(Dataset):
+                                          frame_number=num_frame)
+         local_transforms = FrameTransformMatrix(vod_frame_data)
+         
+-        radar_data = vod_frame_data.radar_data
++        if self.point_source == 'lidar':
++            point_data = getattr(vod_frame_data, 'lidar_data', None)
++            if point_data is None:
++                raise AttributeError(
++                    'FrameDataLoader does not expose lidar_data, but '
++                    "point_source='lidar' requires LiDAR point clouds."
++                )
++            point_data = np.asarray(point_data, dtype=np.float32).copy()
++        else:
++            point_data = self._apply_multiframe_radar_weighting(
++                np.asarray(vod_frame_data.radar_data, dtype=np.float32)
++            )
++            if self.transform_radar_to_lidar:
++                point_data = np.asarray(point_data, dtype=np.float32).copy()
++                if point_data.shape[0] > 0:
++                    radar_xyz_homo = np.ones((point_data.shape[0], 4), dtype=np.float32)
++                    radar_xyz_homo[:, :3] = point_data[:, :3]
++                    point_data[:, :3] = homogeneous_transformation(
++                        radar_xyz_homo,
++                        local_transforms.t_lidar_radar,
++                    )[:, :3]
++            else:
++                point_data = np.asarray(point_data, dtype=np.float32).copy()
++        teacher_lidar = None
++        if self.load_teacher_lidar:
++            teacher_lidar = getattr(vod_frame_data, 'lidar_data', None)
++            if teacher_lidar is None:
++                raise AttributeError(
++                    'FrameDataLoader does not expose lidar_data, but '
++                    'load_teacher_lidar=True requires LiDAR point clouds.'
++                )
++            teacher_lidar = torch.from_numpy(
++                np.asarray(teacher_lidar, dtype=np.float32)
++            )
++        image = vod_frame_data.image if self.load_image else None
++
+ 
+-        
+         gt_labels_3d_list = []
+         gt_bboxes_3d_list = []
+         if self.split != 'test':
+@@ -84,7 +175,30 @@ class ViewOfDelft(Dataset):
+                 
+                     gt_bboxes_3d_list.append(np.concatenate([bbox3d_locs, bbox3d_dims, bbox3d_rot], axis=0))
+ 
+-        radar_data = torch.tensor(radar_data)
++        point_data = torch.from_numpy(np.asarray(point_data, dtype=np.float32))
++        if self.load_image:
++            image = torch.from_numpy(np.asarray(image)).permute(2, 0, 1).contiguous()
++
++            camera_projection_matrix = torch.from_numpy(
++                np.asarray(local_transforms.camera_projection_matrix, dtype=np.float32)
++            )
++            if self.point_source == 'lidar':
++                t_camera_points = torch.from_numpy(
++                    np.asarray(local_transforms.t_camera_lidar, dtype=np.float32)
++                )
++            elif self.transform_radar_to_lidar:
++                t_camera_points = torch.from_numpy(
++                    np.asarray(local_transforms.t_camera_lidar, dtype=np.float32)
++                )
++            else:
++                t_camera_points = torch.from_numpy(
++                    np.asarray(local_transforms.t_camera_radar, dtype=np.float32)
++                )
++            image_shape = tuple(image.shape[-2:])
++        else:
++            camera_projection_matrix = None
++            t_camera_points = None
++            image_shape = None
+         
+         if gt_bboxes_3d_list == []:
+             gt_labels_3d = np.array([0])
+@@ -101,13 +215,18 @@ class ViewOfDelft(Dataset):
+         gt_labels_3d = torch.tensor(gt_labels_3d)
+         
+         return dict(
+-            lidar_data = radar_data,
++            lidar_data = point_data,
++            teacher_lidar = teacher_lidar,
++            image = image,
++            camera_projection_matrix = camera_projection_matrix,
++            t_camera_points = t_camera_points,
+             gt_labels_3d = gt_labels_3d,
+             gt_bboxes_3d = gt_bboxes_3d,
+             meta = dict(
+-                num_frame = num_frame 
++                num_frame = num_frame,
++                image_shape = image_shape,
+             )
+         )
+     
+ 
+-        
+\ No newline at end of file
++        

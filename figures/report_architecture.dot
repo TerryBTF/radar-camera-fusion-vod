@@ -1,0 +1,90 @@
+digraph AMP_Group12_Report {
+    graph [
+        rankdir=LR,
+        bgcolor="white",
+        pad="0.3",
+        nodesep="0.45",
+        ranksep="0.8",
+        splines=ortho,
+        fontname="Microsoft YaHei",
+        labelloc="t",
+        label="AMP Group12 Radar-Only CenterPoint Architecture",
+        fontsize=22
+    ];
+
+    node [
+        shape=box,
+        style="rounded,filled",
+        color="#2C3E50",
+        penwidth=1.3,
+        fontname="Microsoft YaHei",
+        fontsize=14,
+        margin="0.18,0.1"
+    ];
+
+    edge [
+        color="#516B7B",
+        penwidth=1.4,
+        arrowsize=0.75
+    ];
+
+    subgraph cluster_runtime {
+        label="Runtime Entry";
+        color="#BFD7EA";
+        style="rounded";
+
+        config [label="Hydra configs\nbaseline / train / eval / test", fillcolor="#EAF4FB"];
+        entry [label="tools/train.py\ntools/eval.py\ntools/test.py", fillcolor="#EAF4FB"];
+    }
+
+    subgraph cluster_dataset {
+        label="Data Pipeline";
+        color="#C7DCC7";
+        style="rounded";
+
+        split [label="Split files\ntrain.txt / val.txt / test.txt", fillcolor="#F1F8F1"];
+        vod [label="ViewOfDelft\nFrameDataLoader", fillcolor="#F1F8F1"];
+        labels [label="Radar points\n+ label parsing\n+ camera->LiDAR boxes", fillcolor="#F1F8F1"];
+        batch [label="collate_vod_batch\nPyTorch DataLoader", fillcolor="#F1F8F1"];
+    }
+
+    subgraph cluster_model {
+        label="Model Pipeline";
+        color="#F0D9B5";
+        style="rounded";
+
+        v1 [label="Voxelization\nmax points per voxel = 5", fillcolor="#FFF8EE"];
+        v2 [label="PillarFeatureNet\n7-dim input -> 64-dim pillar feature", fillcolor="#FFF8EE"];
+        v3 [label="PointPillarsScatter\nBEV feature map 64 x 160 x 160", fillcolor="#FFF8EE"];
+        v4 [label="SECOND Backbone\n3 stages", fillcolor="#FFF8EE"];
+        v5 [label="SECONDFPN\nmulti-scale fusion", fillcolor="#FFF8EE"];
+        v6 [label="CenterHead\n3 task heads", fillcolor="#FFF8EE"];
+    }
+
+    subgraph cluster_outputs {
+        label="Training and Inference";
+        color="#E4C9E6";
+        style="rounded";
+
+        loss [label="Training branch\nTarget generation\nGaussian focal + L1 loss", fillcolor="#FBF1FC"];
+        decode [label="Inference branch\nBBox decode + circle NMS", fillcolor="#FBF1FC"];
+        eval [label="Validation\nKITTI-format txt + VoD mAP", fillcolor="#FBF1FC"];
+        test [label="Test\nPrediction txt -> zip_files.py", fillcolor="#FBF1FC"];
+    }
+
+    config -> entry;
+    entry -> split;
+    split -> vod;
+    vod -> labels;
+    labels -> batch;
+    batch -> v1;
+    v1 -> v2;
+    v2 -> v3;
+    v3 -> v4;
+    v4 -> v5;
+    v5 -> v6;
+    v6 -> loss;
+    v6 -> decode;
+    decode -> eval;
+    decode -> test;
+}

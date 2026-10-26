@@ -1,0 +1,36 @@
+diff --git a/src/dataset/utils.py b/src/dataset/utils.py
+index cfbf8b3..f580651 100644
+--- a/src/dataset/utils.py
++++ b/src/dataset/utils.py
+@@ -1,17 +1,29 @@
+ def collate_vod_batch(batch):
+     pts_list = []
++    teacher_pts_list = []
++    image_list = []
++    camera_proj_list = []
++    points_to_cam_list = []
+     gt_labels_3d_list = []
+     gt_bboxes_3d_list = []
+     meta_list = []
+     for idx, sample in enumerate(batch):
+         pts_list.append(sample['lidar_data'])
++        teacher_pts_list.append(sample.get('teacher_lidar'))
++        image_list.append(sample['image'])
++        camera_proj_list.append(sample['camera_projection_matrix'])
++        points_to_cam_list.append(sample['t_camera_points'])
+         gt_labels_3d_list.append(sample['gt_labels_3d'])
+         gt_bboxes_3d_list.append(sample['gt_bboxes_3d'])
+         meta_list.append(sample['meta'])
+     return dict(
+         pts = pts_list,
++        teacher_pts = teacher_pts_list,
++        imgs = image_list,
++        camera_projs = camera_proj_list,
++        points_to_cams = points_to_cam_list,
+         gt_labels_3d = gt_labels_3d_list,
+         gt_bboxes_3d = gt_bboxes_3d_list,
+         metas = meta_list
+     )
+-    
+\ No newline at end of file
++    
