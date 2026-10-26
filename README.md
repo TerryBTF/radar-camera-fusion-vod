@@ -1,60 +1,77 @@
-# Radar-Camera Fusion for 3D Object Detection on View-of-Delft
+# Radar-Centric 3D Detection with LiDAR-Guided Geometry Supervision
 
-Improving a radar-only CenterPoint detector on the [View-of-Delft](https://intelligent-vehicles.org/datasets/view-of-delft/) dataset with image fusion, temporal radar cues and ROI-aware training.
-Course project for TU Delft RO47020 *Advanced Machine Perception* (Mar–Apr 2026).
+A radar + monocular camera 3D object detector built on CenterPoint and evaluated on [View-of-Delft](https://intelligent-vehicles.org/datasets/view-of-delft/). LiDAR is used **only during training**, as a privileged geometry signal; inference runs on radar and camera alone.
+Course project for TU Delft RO47020 *Advanced Machine Perception* (Mar–Apr 2026). Authors: Ruifang Zhang, Lude Krikke, Emile de Kam.
 
-**Result (validation set, single seed):** Entire-area mAP **31.96 → 43.55** (+11.59); driving-corridor (ROI) mAP **53.59 → 65.75** (+12.16).
+**Result (validation split):** driving-corridor (ROI) mAP **53.59 → 65.75**; entire-area mAP **31.96 → 42.80** (43.55 for the best entire-area variant).
 
-![Baseline architecture](figures/report_architecture.png)
-<!-- TODO: 加一张 fusion 版本的结构图，或 BEV 预测 vs GT 的可视化 -->
+![Framework overview](figures/overview.png)
 
 ## Problem
 
-Radar is robust in bad weather and cheap, but its point cloud is extremely sparse. In my data analysis, only **~0.2% of radar points fall inside ground-truth boxes**, and pillar occupancy is ~0.75%.
-The starting point is a radar-only CenterPoint (PillarFeatureNet → PointPillarsScatter → SECOND → SECONDFPN → CenterHead, ~5.6M params) provided by the course. The task is to improve it. The baseline code itself is **not** included in this repo (see [Reproduce](#reproduce)).
+Radar is attractive for driving perception: it works in bad weather, measures velocity directly and is cheap. But its point cloud is sparse and noisy. In our data analysis, only **~0.2% of radar points fall inside ground-truth boxes**, and pillar occupancy is ~0.75%. The target metric is detection inside the **driving corridor (ROI)**.
 
-## What I built
+## Method
 
-1. **Point-level image fusion**: radar points are projected into the camera image, ResNet-18 features are sampled at those locations, and a learned gate injects them into the radar features.
-2. **Unified coordinate frame**: radar and image features are fused in the LiDAR frame. This single change gave one of the largest jumps (+2.2 mAP).
-3. **Radar-side structure & temporal input**: deeper voxel encoder, class-wise target radii, 3-frame radar with temporal decay, and RCS Top-K point selection per voxel.
-4. **"big3" upgrade**: lightweight BEV fusion on top of point fusion, an explicit temporal radar encoder, and a LiDAR occupancy auxiliary head used only at training time.
-5. **ROI-aware training**: loss weighting toward the driving corridor and a camera-based prior.
-6. **LiDAR teacher → radar student distillation**: the infrastructure works, but it has **not yet improved the best student** (see Limitations).
+1. **Radar-adapted CenterPoint backbone**: down-weight vertical regression in the loss, widen Circle-NMS and Gaussian heatmap radii for pedestrians and cyclists (radar multipath / ghost detections), add 3D radial distance as an input feature, and use a two-layer pillar encoder with average pooling.
+2. **Radar strengthening**: multi-frame radar input with recency-based weighting of RCS and radial velocity, a normalised time encoding, and RCS-based Top-K point selection inside each pillar.
+3. **Radar-camera fusion**: ResNet-18 layer-2/3 features are sampled at projected radar points (cross-modal point fusion), then a BEV fusion module refines the radar BEV with image-guided cues.
+4. **LiDAR-guided geometry supervision (training only)**: an auxiliary branch predicts LiDAR BEV occupancy/density targets. This strengthens the backbone and is removed at inference.
+5. **ROI-aware fine-tuning**: objects whose centres fall inside the driving corridor get a weight λ_roi > 1 in both the classification and the box-regression loss.
 
 ## Results
 
-Validation set, single seed (47020). For each experiment, the best checkpoint is chosen on validation mAP. The full log, including per-class numbers and failed attempts, is in [docs/experiment-log-zh.md](docs/experiment-log-zh.md) (Chinese).
+All ablations are on the validation split, with 12 epochs per model. Time is the average training time per epoch on the same hardware and batch size.
 
-| Step | Change | Entire mAP | ROI mAP |
-|---|---|---:|---:|
-| Baseline | radar-only CenterPoint | 31.96 | 53.59 |
-| + image (frozen) | `fusion_freeze` | 32.59 | 54.67 |
-| + gated fusion | `centerpoint_radar_gated_fusion_v2` ¹ | 33.82 | 57.37 |
-| + fine-tune image layer3 | `fusion_finetune_layer3` | 34.35 | 57.33 |
-| + training stabilisation | `fusion_finetune_layer3_stable` | 35.37 | 58.71 |
-| + unified LiDAR frame | `..._stable_radar_to_lidar` | 37.55 | 61.91 |
-| + radar structure & 3-frame radar | `..._main_struct_radar_changes` ¹ | 41.34 | 64.18 |
-| + high-res image features | `..._ped_highres` | 41.79 | 64.59 |
-| + BEV fusion, temporal encoder, LiDAR aux | `..._big3` | 43.16 | 64.78 |
-| + ROI training weights | `..._big3_roi_train_weight` | 42.80 | **65.75** |
-| + camera prior | `..._big3_roi_train_weight_camera_prior` | **43.55** | 64.59 |
-| *Reference: LiDAR teacher* | `lidar_teacher` | 43.81 | 60.78 |
+**Main model evolution** (each row adds one component on top of the previous row)
 
-¹ The config for this run is not included in this snapshot.
+| Method | Entire mAP | ROI mAP | Time / epoch |
+|---|---:|---:|---:|
+| Radar baseline | 31.96 | 53.59 | 2:15 |
+| + Radar-adapted backbone | 33.17 | 54.53 | 3:75 ¹ |
+| + Radar-camera BEV fusion | 37.55 | 61.91 | 6:05 |
+| + Radar strengthening | 39.34 | 63.18 | 6:20 |
+| + High-res image features | 41.79 | 63.79 | 6:40 |
+| + LiDAR geometry supervision | **43.16** | 64.78 | 7:01 |
+| + ROI-aware fine-tuning | 42.80 | **65.75** | 8:31 |
+
+¹ As printed in the report.
+
+**ROI fine-tuning ablation**
+
+| Variant | Entire mAP | ROI mAP |
+|---|---:|---:|
+| LiDAR geometry supervision | **43.16** | 64.78 |
+| + Full ROI-aware weighting | 42.80 | **65.75** |
+| + Bbox-only ROI weighting | 42.37 | 65.09 |
+| + Heatmap-only ROI weighting | 42.96 | 64.84 |
+| + Class-aware ROI weighting | 41.72 | 64.22 |
+
+**Alternatives that did not beat the final model**
+
+| Variant | Entire mAP | ROI mAP |
+|---|---:|---:|
+| ROI-aware geometry supervision | 43.34 | 64.35 |
+| Camera prior | **43.55** | 64.59 |
+| Camera prior (pedestrian only) | 42.59 | 64.64 |
+| Radar BEV self-attention (training time 8:31 → 10:00 / epoch) | 41.55 | 63.55 |
 
 **Takeaways**
-- Adding an image branch is not enough by itself (+0.6). The gains come from *how* it is fused, and above all from putting everything in **one geometric frame**.
-- The radar student ends up roughly on par with a LiDAR-only teacher on the entire area, and beats it on ROI (65.75 vs 60.78).
-- Optimising for entire-area mAP and for ROI mAP are not the same thing; the best model depends on which one you choose.
+- Every step contributes. The largest late-stage gain comes from **training-time LiDAR geometry supervision**, which costs nothing at inference.
+- Weighting *both* classification and box regression inside the ROI works best. Weighting only one of them, or reweighting per class, is weaker.
+- Heavier supervision or extra architecture (camera prior, self-attention) can raise entire-area mAP but is less reliable for the driving-corridor objective.
 
 **Limitations**
-- Single seed only, and checkpoint selection on the validation set. Small differences (< ~1 mAP) are within noise.
-- LiDAR-guided distillation reached +1.29 entire-area mAP over the student it started from, but lost ROI mAP. On a later, stronger student it lowered both metrics. It is still an open direction.
+- Single seed, and model selection on the validation split. Differences under ~1 mAP should not be over-read.
+- LiDAR teacher → radar student feature distillation was also tried (see [docs/experiment-log-zh.md](docs/experiment-log-zh.md)). It did not beat the auxiliary-geometry approach and is not part of the final model.
+
+## My role
+
+Built the radar-camera fusion pipeline (point fusion, BEV fusion, high-res image features), the LiDAR geometry supervision and the ROI-aware supervision. Integrated all components into one training and evaluation framework, ran the experiments, and wrote the corresponding sections of the report.
 
 ## Repository layout
 
-This repo contains only my own code. It is an overlay on top of the RO47020 starter code, which is not redistributed here.
+This repo contains the project code only. It is an overlay on top of the RO47020 starter code, which is not redistributed here.
 
 ```text
 src/
